@@ -3,9 +3,9 @@
 import { Container, getContainer } from "@cloudflare/containers";
 
 export class MirofishContainer extends Container {
-  defaultPort = 5001;
-  sleepAfter = "10m"; // scale-to-zero after 10 min idle
-  envVars = {
+   defaultPort = 8080;     // port your container listens on
+  sleepAfter = "5m";
+ envVars = {
     // Secrets you set with `wrangler secret put` are auto-injected;
     // list any plain env passthroughs here if needed.
   };
