@@ -6,7 +6,7 @@ interface Env {
 
 export class MirofishContainer extends Container<Env> {
   // MUST match the port your app inside the Docker image listens on
-  defaultPort = 8080;
+  defaultPort = 5001;
   sleepAfter = "10m";
   // Give the container time to cold-start (model loading, etc.)
   startupTimeout = "120s";
