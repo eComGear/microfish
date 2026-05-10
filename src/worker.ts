@@ -1,31 +1,65 @@
-// Cloudflare Worker that proxies HTTPS traffic to the MiroFish Flask container.
-// Adds permissive CORS so the Lovable frontend can call it from any origin.
 import { Container, getContainer } from "@cloudflare/containers";
 
-export class MirofishContainer extends Container {
-  defaultPort = 8080;          // must match EXPOSE / app bind port
+interface Env {
+  MIROFISH_CONTAINER: DurableObjectNamespace<MirofishContainer>;
+}
+
+export class MirofishContainer extends Container<Env> {
+  // MUST match the port your app inside the Docker image listens on
+  defaultPort = 8080;
   sleepAfter = "10m";
-  startupTimeout = "120s";     // give the image time to boot
- envVars = {
-    // Secrets you set with `wrangler secret put` are auto-injected;
-    // list any plain env passthroughs here if needed.
-  };
+  // Give the container time to cold-start (model loading, etc.)
+  startupTimeout = "120s";
+
+  override onStart() {
+    console.log("MirofishContainer started");
+  }
+  override onStop() {
+    console.log("MirofishContainer stopped");
+  }
+  override onError(error: unknown) {
+    console.error("MirofishContainer error:", error);
+  }
 }
 
 const CORS = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, Authorization, Accept-Language",
-  "Access-Control-Max-Age": "86400",
+  "access-control-allow-origin": "*",
+  "access-control-allow-headers": "Content-Type, Authorization, Accept-Language",
+  "access-control-allow-methods": "GET, POST, PUT, DELETE, OPTIONS",
+  "access-control-max-age": "86400",
 };
 
 export default {
-  async fetch(request: Request, env: { MIROFISH: DurableObjectNamespace<MirofishContainer> }) {
-    if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS });
-    const container = getContainer(env.MIROFISH, "singleton");
-    const res = await container.fetch(request);
-    const headers = new Headers(res.headers);
-    for (const [k, v] of Object.entries(CORS)) headers.set(k, v);
-    return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
+  async fetch(request: Request, env: Env): Promise<Response> {
+    if (request.method === "OPTIONS") {
+      return new Response(null, { headers: CORS });
+    }
+
+    try {
+      // Route everything to a single shared container instance.
+      // For per-user isolation, swap "singleton" for a user/session id.
+      const container = getContainer(env.MIROFISH_CONTAINER, "singleton");
+      const upstream = await container.fetch(request);
+
+      const headers = new Headers(upstream.headers);
+      for (const [k, v] of Object.entries(CORS)) headers.set(k, v);
+      return new Response(upstream.body, {
+        status: upstream.status,
+        statusText: upstream.statusText,
+        headers,
+      });
+    } catch (err) {
+      console.error("Worker fetch error:", err);
+      return new Response(
+        JSON.stringify({
+          error: "WORKER_ERROR",
+          message: err instanceof Error ? err.message : String(err),
+        }),
+        {
+          status: 500,
+          headers: { "content-type": "application/json", ...CORS },
+        }
+      );
+    }
   },
 };
