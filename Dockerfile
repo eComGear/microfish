@@ -17,3 +17,11 @@ WORKDIR /app/backend
 ENV PORT=5001 HOST=0.0.0.0
 EXPOSE 5001
 CMD ["python", "run.py"]
+
+FROM node:22-slim
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --omit=dev
+COPY . .
+EXPOSE 8080
+CMD ["node", "server.js"]
