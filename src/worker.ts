@@ -3,8 +3,9 @@
 import { Container, getContainer } from "@cloudflare/containers";
 
 export class MirofishContainer extends Container {
-   defaultPort = 8080;     // port your container listens on
-  sleepAfter = "5m";
+  defaultPort = 8080;          // must match EXPOSE / app bind port
+  sleepAfter = "10m";
+  startupTimeout = "120s";     // give the image time to boot
  envVars = {
     // Secrets you set with `wrangler secret put` are auto-injected;
     // list any plain env passthroughs here if needed.
