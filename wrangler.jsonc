@@ -1,26 +1,31 @@
 {
-  "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "mirofish-backend",
-  "main": "src/worker.ts",
+  "name": "microfish",
+  "main": "src/index.ts",
   "compatibility_date": "2025-05-01",
   "compatibility_flags": ["nodejs_compat"],
+
   "containers": [
     {
       "class_name": "MirofishContainer",
       "image": "./Dockerfile",
-      "max_instances": 3,
-      "instance_type": "standard-3",
-      "name": "mirofish"
+      "max_instances": 10,
+      "instance_type": "standard"
     }
   ],
+
   "durable_objects": {
     "bindings": [
-      { "class_name": "MirofishContainer", "name": "MIROFISH" }
+      {
+        "name": "MIROFISH_CONTAINER",
+        "class_name": "MirofishContainer"
+      }
     ]
   },
+
   "migrations": [
-    { "tag": "v1", "new_sqlite_classes": ["MirofishContainer"] }
-  ],
-  "observability": { "enabled": true }
-  // Add secrets via:  wrangler secret put OPENAI_API_KEY
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["MirofishContainer"]
+    }
+  ]
 }
