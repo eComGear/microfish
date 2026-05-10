@@ -1,0 +1,14 @@
+{
+  "name": "mirofish-cf",
+  "private": true,
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "tail": "wrangler tail"
+  },
+  "devDependencies": {
+    "wrangler": "^3.95.0",
+    "@cloudflare/containers": "^0.0.20",
+    "typescript": "^5.6.0"
+  }
+}
