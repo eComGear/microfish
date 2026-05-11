@@ -1,7 +1,6 @@
 {
-  "default": "en",
-  "supported": ["en"]
-
+  "default": "zh",
+  "supported": ["zh", "en"],
   "zh": { "llmInstruction": "请使用中文回答。" },
   "en": { "llmInstruction": "Please respond in English." }
 }
