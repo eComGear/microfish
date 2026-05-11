@@ -5,7 +5,7 @@ from flask import request, has_request_context
 
 _thread_local = threading.local()
 
-_locales_dir = os.path.join(os.path.dirname(__file__), '..', '..', '..', 'locales')
+_locales_dir = os.path.join(os.path.dirname(__file__), '..', '..', 'locales')
 
 # Load language registry
 with open(os.path.join(_locales_dir, 'languages.json'), 'r', encoding='utf-8') as f:
