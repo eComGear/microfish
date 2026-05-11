@@ -597,8 +597,8 @@ def prepare_simulation():
                     defined_entity_types=entity_types_list,
                     use_llm_for_profiles=use_llm_for_profiles,
                     progress_callback=progress_callback,
-                    parallel_profile_count=parallel_profile_count
-                    max_agents=max_agents,  # NEW
+                    parallel_profile_count=parallel_profile_count,
+                    max_agents=max_agents  # NEW
                 )
                 
                 # 任务完成
