@@ -16,9 +16,8 @@ def create_project():
     try:
         data = request.get_json(silent=True) or {}
         name = data.get('name') or 'Untitled Project'
-        description = data.get('description', '')
 
-        project = ProjectManager.create_project(name=name, description=description)
+        project = ProjectManager.create_project(name=name)
         logger.info(f"已建立專案: {project.project_id}")
 
         return jsonify({
@@ -38,6 +37,10 @@ def get_project(project_id):
         project = ProjectManager.get_project(project_id)
         if not project:
             return jsonify({'success': False, 'error': 'projectNotFound'}), 404
-        return jsonify({'success': True, 'project_id': project.project_id})
+        return jsonify({
+            'success': True,
+            'project_id': project.project_id,
+        })
     except Exception as e:
+        logger.exception("查詢專案失敗")
         return jsonify({'success': False, 'error': str(e)}), 500
