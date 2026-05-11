@@ -1,4 +1,7 @@
 {
   "default": "en",
   "supported": ["en"]
+
+  "zh": { "llmInstruction": "请使用中文回答。" },
+  "en": { "llmInstruction": "Please respond in English." }
 }
