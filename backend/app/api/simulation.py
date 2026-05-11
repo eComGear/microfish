@@ -467,16 +467,7 @@ def prepare_simulation():
         entity_types_list = data.get('entity_types')
         use_llm_for_profiles = data.get('use_llm_for_profiles', True)
         parallel_profile_count = data.get('parallel_profile_count', 5)
-        # NEW: 限制最多生成的 agent 數量(0 或 None = 不限制)
-        max_agents = data.get('max_agents')
-        if max_agents is not None:
-            try:
-                max_agents = int(max_agents)
-                if max_agents <= 0:
-                    max_agents = None
-            except (ValueError, TypeError):
-                max_agents = None
-
+        max_agents = data.get('max_agents')  # 可选: 截断 agent 数量(前端控制)
         
         # ========== 同步获取实体数量（在后台任务启动前） ==========
         # 这样前端在调用prepare后立即就能获取到预期Agent总数
@@ -598,7 +589,7 @@ def prepare_simulation():
                     use_llm_for_profiles=use_llm_for_profiles,
                     progress_callback=progress_callback,
                     parallel_profile_count=parallel_profile_count,
-                    max_agents=max_agents  # NEW
+                    max_agents=max_agents
                 )
                 
                 # 任务完成
@@ -2725,3 +2716,4 @@ def close_simulation_env():
             "error": str(e),
             "traceback": traceback.format_exc()
         }), 500
+
