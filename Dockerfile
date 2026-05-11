@@ -27,3 +27,4 @@ EXPOSE 8080
 # Example: if backend/app.py has `app = Flask(__name__)` → "app:app"
 #          if backend/wsgi.py has `application = ...` → "wsgi:application"
 CMD ["gunicorn", "--bind", "0.0.0.0:8080", "--workers", "1", "--threads", "4", "--timeout", "300", "run:app"]
+
