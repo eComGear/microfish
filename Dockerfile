@@ -1,29 +1,20 @@
+# Single image used for BOTH the API and the worker.
+# fly.api.toml runs `node dist/api/server.js`.
+# fly.worker.toml is a no-op machine app; spawnWorkerMachine sets cmd dynamically.
 
-FROM python:3.11-slim
-
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1 \
-    PORT=8080
-
+FROM node:20-slim AS build
 WORKDIR /app
+COPY package.json ./
+RUN npm install --omit=dev=false
+COPY tsconfig.json ./
+COPY src ./src
+RUN npx tsc -p tsconfig.json
 
-# System deps for numpy/torch/etc.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential git curl \
-    && rm -rf /var/lib/apt/lists/*
-
-# Install Python deps first (better layer caching)
-COPY backend/requirements.txt ./requirements.txt
-RUN pip install --upgrade pip && pip install -r requirements.txt
-RUN pip install gunicorn
-
-# Copy app code
-COPY backend/ ./
-
+FROM node:20-slim
+WORKDIR /app
+ENV NODE_ENV=production
+COPY --from=build /app/node_modules ./node_modules
+COPY --from=build /app/dist ./dist
+COPY package.json ./
 EXPOSE 8080
-
-# Adjust "app:app" if your Flask entrypoint differs
-# Example: if backend/app.py has `app = Flask(__name__)` → "app:app"
-#          if backend/wsgi.py has `application = ...` → "wsgi:application"
-CMD ["gunicorn", "--bind", "0.0.0.0:8080", "--workers", "1", "--threads", "4", "--timeout", "300", "run:app"]
+CMD ["node", "dist/api/server.js"]

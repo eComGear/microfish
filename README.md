@@ -1,50 +1,67 @@
-# MiroFish Backend on Cloudflare Containers
+# MicroFish — Option 3 (fly.io machine-per-simulation)
 
-Deploys the MiroFish Flask + camel-ai backend as a Cloudflare Container fronted by a Worker.
+Drop these files into the MicroFish repo. They give you:
 
-## Prerequisites
-- Node 18+
-- Cloudflare account with Containers enabled (Workers Paid plan)
-- `npm i -g wrangler` and `wrangler login`
+1. `migrations/001_pipeline_jobs.sql` — durable job table
+2. `src/api/server.ts` — `POST /pipeline/run` endpoint Lovable calls
+3. `src/worker/run-pipeline.ts` — one process per simulation
+4. `Dockerfile` + `fly.api.toml` + `fly.worker.toml` — fly deploy config
 
-## Setup
-1. Drop the MiroFish source into this folder so the layout looks like:
-   ```
-   mirofish-cf/
-     Dockerfile
-     wrangler.jsonc
-     src/worker.ts
-     package.json
-     backend/        <-- from https://github.com/666ghj/MiroFish
-   ```
-   (Easiest: `git clone https://github.com/666ghj/MiroFish tmp && cp -r tmp/backend ./backend`.)
+## One-time setup
 
-2. Install Worker deps:
-   ```
-   npm install
-   ```
+```bash
+# 1. Migrate Postgres
+psql "$DATABASE_URL" -f migrations/001_pipeline_jobs.sql
 
-3. Add your LLM secrets (one per command, paste value when prompted):
-   ```
-   wrangler secret put OPENAI_API_KEY
-   wrangler secret put OPENAI_BASE_URL
-   wrangler secret put DEEPSEEK_API_KEY
-   wrangler secret put ZEP_API_KEY
-   ```
-   Add any other secrets from `backend/.env.example`.
+# 2. Create both fly apps
+flyctl apps create microfish-api
+flyctl apps create microfish-worker
 
-4. Deploy:
-   ```
-   npm run deploy
-   ```
-   Wrangler prints a URL like `https://mirofish-backend.<your-subdomain>.workers.dev`.
+# 3. Set secrets on BOTH apps
+for app in microfish-api microfish-worker; do
+  flyctl secrets set -a $app \
+    DATABASE_URL="postgres://..." \
+    SUPABASE_URL="https://xxx.supabase.co" \
+    SUPABASE_SERVICE_ROLE_KEY="..." \
+    DEEPSEEK_API_KEY="..." \
+    PIPELINE_RUN_TOKEN="$(openssl rand -hex 32)" \
+    FLY_API_TOKEN="$(flyctl auth token)" \
+    FLY_WORKER_APP="microfish-worker" \
+    FLY_WORKER_IMAGE="registry.fly.io/microfish-worker:latest" \
+    FLY_WORKER_REGION="iad" \
+    FLY_WORKER_CPUS="1" \
+    FLY_WORKER_MEMORY_MB="512"
+done
 
-5. Paste that URL into the Lovable app:
-   - Project Settings → Build Secrets → add `VITE_MIROFISH_API_URL` with that URL.
-   - Trigger a rebuild.
+# 4. Build and push the worker image first (so the API can spawn it)
+flyctl deploy -c fly.worker.toml --build-only --push --image-label latest
 
-## Notes
-- Container scales to zero after 10 min idle; first request after sleep takes ~30s cold-start.
-- `instance_type: standard-3` = 4 vCPU / 12 GB RAM. Bump to `standard-4` if simulations OOM.
-- View live logs: `npm run tail`.
-- Inbound CORS is wide open (`*`); tighten in `src/worker.ts` once you know your prod origin.
+# 5. Deploy the API
+flyctl deploy -c fly.api.toml
+```
+
+## How it works
+
+```
+Lovable → POST https://microfish-api.fly.dev/pipeline/run
+          Authorization: Bearer $PIPELINE_RUN_TOKEN
+          { reportId, userId, prompt, scenario, seedFileUrl }
+   ↓
+API inserts pipeline_jobs row, calls fly Machines API to spawn worker, returns 202
+   ↓
+Worker machine boots → reads JOB_ID env → runs pipeline → updates Supabase reports
+   ↓
+Worker exits → fly auto-destroys the machine ($0 idle cost)
+```
+
+## Wire the real pipeline
+
+Open `src/worker/run-pipeline.ts` and replace the commented stubs
+(`uploadSeed`, `buildGraph`, `prepare`, `startSimulation`, `runRounds`) with
+imports from your existing MicroFish modules.
+
+## Stuck-job recovery (optional, recommended)
+
+`pipeline_jobs_stuck` view lists jobs whose worker died without writing a
+final status. Run a small cron (every 60s) that selects from this view and
+either re-spawns a worker or marks them failed after `max_attempts`.

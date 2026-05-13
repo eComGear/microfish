@@ -1,14 +1,24 @@
 {
-  "name": "mirofish-cf",
+  "name": "microfish-pipeline",
+  "version": "1.0.0",
   "private": true,
+  "type": "module",
   "scripts": {
-    "deploy": "wrangler deploy",
-    "dev": "wrangler dev",
-    "tail": "wrangler tail"
+    "build": "tsc -p tsconfig.json",
+    "start:api": "node dist/api/server.js",
+    "start:worker": "node dist/worker/run-pipeline.js",
+    "migrate": "psql \"$DATABASE_URL\" -f migrations/001_pipeline_jobs.sql"
   },
- "devDependencies": {
-  "wrangler": "^4.0.0",
-  "@cloudflare/containers": "^0.0.20"
-}
-
+  "dependencies": {
+    "@hono/node-server": "^1.12.0",
+    "@supabase/supabase-js": "^2.45.0",
+    "hono": "^4.5.0",
+    "pg": "^8.12.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@types/pg": "^8.11.0",
+    "typescript": "^5.5.0"
+  }
 }

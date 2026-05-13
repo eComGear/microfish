@@ -1,0 +1,10 @@
+# Worker app. Holds NO running machines by default; the API spawns one per job.
+# Same Docker image; the spawn call overrides cmd to run dist/worker/run-pipeline.js.
+app = "microfish-worker"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+# Deliberately no [http_service] and no [[vm]] — workers are created on demand
+# via the Machines API in src/lib/fly-machines.ts.
