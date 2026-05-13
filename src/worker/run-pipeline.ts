@@ -7,14 +7,14 @@
 // BOTH `pipeline_jobs` (ops) and `reports` (what the Lovable UI polls).
 // On any throw: marks job failed, marks report failed, exits 1 (no restart).
 
-import { pool } from "../lib/db";
-import { supabaseAdmin } from "../lib/supabase";
+import { pool } from "../lib/db.js";
+import { supabaseAdmin } from "../lib/supabase.js";
 
 // --- existing MicroFish pipeline modules (already in this repo) -------------
-import { generateOntologyFromFiles } from "../services/ontology";
-import { buildGraphAndWait }         from "../services/graph";
-import { prepareAndWait, startSimulation, getSimulationStatus } from "../services/simulation";
-import { generateReport, getReportStatus } from "../services/report";
+import { generateOntologyFromFiles } from "../services/ontology.js";
+import { buildGraphAndWait }         from "../services/graph.js";
+import { prepareAndWait, startSimulation, getSimulationStatus } from "../services/simulation.js";
+import { generateReport, getReportStatus } from "../services/report.js";
 // ----------------------------------------------------------------------------
 
 const JOB_ID = process.env.JOB_ID;
@@ -29,7 +29,7 @@ type JobRow = {
   report_id: string;
   simulation_id: string | null;
   payload: {
-    files: Array<{ name: string; bucket: string; path: string }>; // Supabase Storage refs
+    files: Array<{ name: string; bucket: string; path: string }>;
     simulation_requirement: string;
     project_name?: string;
     additional_context?: string;
@@ -54,14 +54,13 @@ async function loadJob(): Promise<JobRow> {
   return rows[0] as JobRow;
 }
 
-/** Heartbeat + progress to BOTH tables. UI polls `reports`; ops watches `pipeline_jobs`. */
 async function mark(job: JobRow, patch: {
   stage?: Stage;
   progress?: number;
   message?: string;
   status?: "running" | "completed" | "failed";
   simulation_id?: string;
-  report_id_external?: string; // microfish report id
+  report_id_external?: string;
   graph_id?: string;
   error?: string;
 }) {
@@ -124,7 +123,7 @@ async function runPipeline() {
   const { graph_id } = await buildGraphAndWait({ project_id });
   await mark(job, { graph_id, progress: 35 });
 
-  // 3. Prepare simulation (creates sim + agent profiles)
+  // 3. Prepare simulation
   await mark(job, { stage: "prepare", progress: 40, message: "建立模擬與 agent profiles" });
   const { simulation_id } = await prepareAndWait({
     project_id,
@@ -143,7 +142,6 @@ async function runPipeline() {
     num_agents: job.payload.num_agents,
     num_rounds: job.payload.num_rounds,
   });
-  // poll
   for (;;) {
     const st = await getSimulationStatus(simulation_id);
     const pct = 60 + Math.min(25, Math.round(((st.progress_percent ?? 0) / 100) * 25));
@@ -197,3 +195,4 @@ runPipeline()
     process.exit(1);
   });
 
+  });
