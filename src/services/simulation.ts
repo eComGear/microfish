@@ -1,4 +1,4 @@
-import { http } from "./_http.js";
+import { call } from "./_http.js";
 
 export type SimStatus = {
   status: string;
