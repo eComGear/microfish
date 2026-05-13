@@ -1,4 +1,4 @@
-import { http } from "./_http.js";
+import { call } from "./_http.js";
 
 export async function generateReport(input: {
   simulation_id: string;
