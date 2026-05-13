@@ -195,4 +195,3 @@ runPipeline()
     process.exit(1);
   });
 
-  });
