@@ -1,4 +1,4 @@
-import { call } from "./_http";
+import { http } from "./_http.js";
 
 export type OntologyResult = {
   project_id: string;
