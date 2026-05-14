@@ -162,3 +162,125 @@ def get_report_by_simulation(simulation_id: str) -> Optional[Dict[str, Any]]:
 # Back-compat aliases (old call sites)
 sb = _client
 
+# ---------- projects ----------
+
+def upsert_project(state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Mirror a project dict to Supabase. Keyed by project_id."""
+    sb = _client()
+    if sb is None or not isinstance(state, dict):
+        return None
+    project_id = state.get("project_id")
+    if not project_id:
+        return None
+    row = {
+        "project_id": str(project_id),
+        "name": state.get("name") or "Unnamed Project",
+        "status": state.get("status") or "created",
+        "files": state.get("files") or [],
+        "total_text_length": state.get("total_text_length") or 0,
+        "ontology": state.get("ontology"),
+        "analysis_summary": state.get("analysis_summary"),
+        "graph_id": state.get("graph_id"),
+        "graph_build_task_id": state.get("graph_build_task_id"),
+        "simulation_requirement": state.get("simulation_requirement"),
+        "chunk_size": state.get("chunk_size") or 500,
+        "chunk_overlap": state.get("chunk_overlap") or 50,
+        "error": state.get("error"),
+        "extracted_text": state.get("extracted_text"),
+    }
+    # Drop None so Postgres defaults / existing values stick.
+    row = {k: v for k, v in row.items() if v is not None}
+    try:
+        res = sb.table("engine_projects").upsert(row, on_conflict="project_id").execute()
+        return (res.data or [None])[0]
+    except Exception as e:  # noqa: BLE001
+        log.warning("supabase_store.upsert_project failed: %s", e)
+        return None
+
+
+def get_project(project_id: str) -> Optional[Dict[str, Any]]:
+    sb = _client()
+    if sb is None or not project_id:
+        return None
+    try:
+        res = (
+            sb.table("engine_projects")
+            .select("*")
+            .eq("project_id", str(project_id))
+            .limit(1)
+            .execute()
+        )
+        rows = res.data or []
+        return rows[0] if rows else None
+    except Exception as e:  # noqa: BLE001
+        log.warning("supabase_store.get_project failed: %s", e)
+        return None
+
+
+def list_projects(limit: int = 50) -> list:
+    sb = _client()
+    if sb is None:
+        return []
+    try:
+        res = (
+            sb.table("engine_projects")
+            .select("*")
+            .order("created_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        return res.data or []
+    except Exception as e:  # noqa: BLE001
+        log.warning("supabase_store.list_projects failed: %s", e)
+        return []
+
+
+def delete_project(project_id: str) -> bool:
+    sb = _client()
+    if sb is None or not project_id:
+        return False
+    try:
+        sb.table("engine_projects").delete().eq("project_id", str(project_id)).execute()
+        return True
+    except Exception as e:  # noqa: BLE001
+        log.warning("supabase_store.delete_project failed: %s", e)
+        return False
+
+
+def save_extracted_text(project_id: str, text: str) -> bool:
+    """Convenience: just update the extracted_text column."""
+    sb = _client()
+    if sb is None or not project_id:
+        return False
+    try:
+        sb.table("engine_projects").update({
+            "extracted_text": text,
+            "total_text_length": len(text),
+        }).eq("project_id", str(project_id)).execute()
+        return True
+    except Exception as e:  # noqa: BLE001
+        log.warning("supabase_store.save_extracted_text failed: %s", e)
+        return False
+
+
+def get_extracted_text(project_id: str) -> Optional[str]:
+    sb = _client()
+    if sb is None or not project_id:
+        return None
+    try:
+        res = (
+            sb.table("engine_projects")
+            .select("extracted_text")
+            .eq("project_id", str(project_id))
+            .limit(1)
+            .execute()
+        )
+        rows = res.data or []
+        if not rows:
+            return None
+        return rows[0].get("extracted_text")
+    except Exception as e:  # noqa: BLE001
+        log.warning("supabase_store.get_extracted_text failed: %s", e)
+        return None
+
+
