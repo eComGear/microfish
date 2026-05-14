@@ -242,3 +242,35 @@ __all__ = [
     "get_task",
 ]
 
+import hashlib, json
+
+def compute_input_hash(payload: dict) -> str:
+    canon = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(canon.encode("utf-8")).hexdigest()
+
+def get_cached_simulation(project_id: str, input_hash: str):
+    r = _client().table("simulations").select("*") \
+        .eq("project_id", project_id).eq("input_hash", input_hash) \
+        .maybe_single().execute()
+    return r.data if r and r.data else None
+
+def upsert_simulation(project_id: str, input_hash: str, *,
+                      config=None, result=None, status="pending", error=None):
+    row = {
+        "project_id": project_id,
+        "input_hash": input_hash,
+        "config": config,
+        "result": result,
+        "status": status,
+        "error": error,
+        "updated_at": "now()",
+    }
+    return _client().table("simulations").upsert(
+        row, on_conflict="project_id,input_hash"
+    ).execute()
+
+def list_simulations(project_id: str, limit: int = 50):
+    r = _client().table("simulations").select("*") \
+        .eq("project_id", project_id) \
+        .order("created_at", desc=True).limit(limit).execute()
+    return r.data or []
