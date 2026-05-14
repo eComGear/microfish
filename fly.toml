@@ -1,28 +1,39 @@
-app = 'microfish'
-primary_region = 'sin'
+# fly.toml — microfish backend
+app = "microfish"
+primary_region = "hkg"
+
+[build]
 
 [env]
-  PORT = '8080'
-  FLASK_PORT = '8080'
-  PYTHONUNBUFFERED = '1'
+  PORT = "8080"
+  PYTHONUNBUFFERED = "1"
 
 [http_service]
   internal_port = 8080
   force_https = true
-  auto_stop_machines = 'stop'
+  auto_stop_machines = false
   auto_start_machines = true
-  min_machines_running = 0
-  processes = ['app']
+  min_machines_running = 1
+  processes = ["app"]
 
-  [[http_service.checks]]
-    interval = '30s'
-    timeout = '10s'
-    grace_period = '2m0s'
-    method = 'GET'
-    path = '/health'
+  [http_service.concurrency]
+    type = "requests"
+    hard_limit = 250
+    soft_limit = 200
+
+[[http_service.checks]]
+  interval = "30s"
+  timeout = "5s"
+  grace_period = "10s"
+  method = "GET"
+  path = "/health"
 
 [[vm]]
-  cpu_kind = 'shared'
-  cpus = 2
-  memory_mb = 4096
+  size = "shared-cpu-1x"
+  memory = "512mb"
+  cpu_kind = "shared"
+  cpus = 1
 
+[[mounts]]
+  source = "microfish_data"
+  destination = "/data"
