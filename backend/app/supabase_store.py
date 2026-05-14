@@ -1,231 +1,244 @@
-# backend/app/graph_routes.py
+# backend/app/supabase_store.py
+"""
+Supabase persistence layer for MicroFish backend.
+Self-contained: does NOT import from app.models or any sibling that imports back.
+"""
+from __future__ import annotations
+
 import os
-import uuid
+import json
 import logging
-import threading
-import traceback
-from typing import Any, Optional
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
 
-from flask import Blueprint, request, jsonify
-
-from .supabase_store import (
-    get_extracted_text,
-    upsert_project,
-    get_project,
-)
-
-# 你的圖譜建構函式;名稱依實際情況調整
-# 預期簽名: build_graph_from_text(text: str, ontology: dict | None, project_id: str) -> dict
-from .graph_builder import build_graph_from_text
+from supabase import create_client, Client
 
 log = logging.getLogger(__name__)
 
-bp = Blueprint("graph", __name__)
-
 # ---------------------------------------------------------------------------
-# In-memory task store
-# 單機 Flask 夠用;多 worker 部署請改成 Redis / Supabase 表
+# Config
 # ---------------------------------------------------------------------------
-_TASKS: dict[str, dict[str, Any]] = {}
-_TASKS_LOCK = threading.Lock()
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
+SUPABASE_KEY = (
+    os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+    or os.environ.get("SUPABASE_KEY")
+    or os.environ.get("SUPABASE_ANON_KEY")
+    or ""
+)
+
+PROJECTS_TABLE = os.environ.get("SB_PROJECTS_TABLE", "engine_projects")
+EXTRACTED_TEXTS_TABLE = os.environ.get("SB_EXTRACTED_TEXTS_TABLE", "engine_extracted_texts")
+GRAPHS_TABLE = os.environ.get("SB_GRAPHS_TABLE", "engine_graphs")
+TASKS_TABLE = os.environ.get("SB_TASKS_TABLE", "engine_tasks")
+
+_client: Optional[Client] = None
 
 
-def _set_task(task_id: str, **fields) -> None:
-    with _TASKS_LOCK:
-        cur = _TASKS.get(task_id, {})
-        cur.update(fields)
-        _TASKS[task_id] = cur
-
-
-def _get_task(task_id: str) -> Optional[dict[str, Any]]:
-    with _TASKS_LOCK:
-        return _TASKS.get(task_id)
+def client() -> Client:
+    global _client
+    if _client is None:
+        if not SUPABASE_URL or not SUPABASE_KEY:
+            raise RuntimeError("SUPABASE_URL / SUPABASE_KEY env not set")
+        _client = create_client(SUPABASE_URL, SUPABASE_KEY)
+    return _client
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-def _as_text(v) -> str:
-    """把任何資料形狀安全轉成 str,避免 'list' object has no attribute 'strip'."""
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _as_text(v: Any) -> str:
+    """Coerce any stored value to a plain string. Prevents '.strip on list' errors."""
     if v is None:
         return ""
     if isinstance(v, str):
         return v
-    if isinstance(v, list):
+    if isinstance(v, (list, tuple)):
         parts = []
         for item in v:
-            if isinstance(item, str):
-                parts.append(item)
-            elif isinstance(item, dict):
-                parts.append(str(item.get("content") or item.get("text") or ""))
-            else:
-                parts.append(str(item))
+            parts.append(_as_text(item))
         return "\n\n".join(p for p in parts if p)
     if isinstance(v, dict):
-        return str(v.get("content") or v.get("text") or "")
+        for k in ("content", "text", "extracted_text", "value"):
+            if k in v:
+                return _as_text(v[k])
+        try:
+            return json.dumps(v, ensure_ascii=False)
+        except Exception:
+            return str(v)
     return str(v)
 
 
-def _coerce_project_id(value) -> str:
-    """前端有時把整個 project dict 傳進來,這裡取出 project_id."""
+def _coerce_id(value: Any, name: str = "id") -> str:
+    """Accept str OR dict({'project_id': '...'}) — normalize to str."""
+    if isinstance(value, str):
+        return value
     if isinstance(value, dict):
-        pid = value.get("project_id") or value.get("id")
-        if not pid:
-            raise ValueError("project_id missing in dict payload")
-        return str(pid)
-    if value is None:
-        raise ValueError("project_id is required")
-    return str(value)
+        for k in (name, "id", "project_id", "graph_id", "task_id"):
+            if k in value and isinstance(value[k], str):
+                return value[k]
+    raise TypeError(f"{name} must be a string, got {type(value).__name__}: {value!r}")
 
 
 # ---------------------------------------------------------------------------
-# Build worker
+# Projects
 # ---------------------------------------------------------------------------
-def _run_build(task_id: str, project_id: str) -> None:
+def save_project(project: Dict[str, Any]) -> Dict[str, Any]:
+    pid = _coerce_id(project.get("project_id") or project.get("id"), "project_id")
+    row = {
+        "project_id": pid,
+        "name": project.get("name"),
+        "status": project.get("status", "created"),
+        "data": project,
+        "updated_at": _now(),
+    }
+    if "created_at" not in project:
+        row["created_at"] = _now()
+    client().table(PROJECTS_TABLE).upsert(row, on_conflict="project_id").execute()
+    return project
+
+
+def get_project(project_id: Any) -> Optional[Dict[str, Any]]:
+    pid = _coerce_id(project_id, "project_id")
+    res = client().table(PROJECTS_TABLE).select("data").eq("project_id", pid).limit(1).execute()
+    rows = res.data or []
+    if not rows:
+        return None
+    return rows[0].get("data") or None
+
+
+def list_projects() -> List[Dict[str, Any]]:
+    res = (
+        client()
+        .table(PROJECTS_TABLE)
+        .select("data")
+        .order("updated_at", desc=True)
+        .execute()
+    )
+    return [r["data"] for r in (res.data or []) if r.get("data")]
+
+
+def delete_project(project_id: Any) -> None:
+    pid = _coerce_id(project_id, "project_id")
+    client().table(PROJECTS_TABLE).delete().eq("project_id", pid).execute()
+    client().table(EXTRACTED_TEXTS_TABLE).delete().eq("project_id", pid).execute()
+
+
+# ---------------------------------------------------------------------------
+# Extracted texts
+# ---------------------------------------------------------------------------
+def save_extracted_text(
+    project_id: Any,
+    content: Any,
+    source_id: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> None:
+    pid = _coerce_id(project_id, "project_id")
+    text = _as_text(content)
+    row = {
+        "project_id": pid,
+        "source_id": source_id or "default",
+        "content": text,
+        "metadata": metadata or {},
+        "created_at": _now(),
+    }
     try:
-        log.info("[%s] 开始构建图谱...", task_id)
-        _set_task(
-            task_id,
-            status="running",
-            progress=5,
-            message="loading extracted text",
-            project_id=project_id,
-        )
-
-        # supabase_store.get_extracted_text 已改為回傳 str
-        raw = get_extracted_text(project_id)
-        text = _as_text(raw).strip()
-
-        if not text:
-            raise ValueError("no extracted text for project")
-
-        _set_task(task_id, progress=20, message="building graph")
-
-        project = get_project(project_id) or {}
-        ontology = project.get("ontology")
-
-        result = build_graph_from_text(text, ontology=ontology, project_id=project_id)
-
-        graph_id = (
-            result.get("graph_id")
-            if isinstance(result, dict)
-            else None
-        ) or f"graph_{uuid.uuid4().hex[:12]}"
-
-        # 把 graph_id 寫回 project
-        try:
-            upsert_project(
-                {
-                    "project_id": project_id,
-                    "graph_id": graph_id,
-                    "graph_build_task_id": task_id,
-                }
-            )
-        except Exception as e:
-            log.warning("[%s] upsert_project(graph_id) failed: %s", task_id, e)
-
-        _set_task(
-            task_id,
-            status="succeeded",
-            progress=100,
-            message="done",
-            graph_id=graph_id,
-            result=result if isinstance(result, dict) else {"graph_id": graph_id},
-        )
-        log.info("[%s] 图谱构建完成 graph_id=%s", task_id, graph_id)
-
+        client().table(EXTRACTED_TEXTS_TABLE).upsert(
+            row, on_conflict="project_id,source_id"
+        ).execute()
     except Exception as e:
-        tb = traceback.format_exc()
-        log.error("[%s] 图谱构建失败: %s\n%s", task_id, e, tb)
-        _set_task(
-            task_id,
-            status="failed",
-            progress=100,
-            message="failed",
-            error=str(e),
-        )
+        log.warning("upsert failed (%s); falling back to delete+insert", e)
+        client().table(EXTRACTED_TEXTS_TABLE).delete().eq("project_id", pid).eq(
+            "source_id", row["source_id"]
+        ).execute()
+        client().table(EXTRACTED_TEXTS_TABLE).insert(row).execute()
+
+
+def get_extracted_text(project_id: Any) -> str:
+    """Always returns a single concatenated string (never list/dict)."""
+    pid = _coerce_id(project_id, "project_id")
+    res = (
+        client()
+        .table(EXTRACTED_TEXTS_TABLE)
+        .select("content,created_at")
+        .eq("project_id", pid)
+        .order("created_at", desc=False)
+        .execute()
+    )
+    rows = res.data or []
+    if not rows:
+        return ""
+    parts = [_as_text(r.get("content")) for r in rows]
+    return "\n\n".join(p for p in parts if p)
 
 
 # ---------------------------------------------------------------------------
-# Routes
+# Graphs
 # ---------------------------------------------------------------------------
-@bp.post("/api/graph/build")
-def graph_build():
-    """啟動 async 圖譜建構,回傳 task_id."""
-    payload = request.get_json(silent=True) or {}
+def save_graph(graph_id: Any, project_id: Any, data: Dict[str, Any]) -> None:
+    gid = _coerce_id(graph_id, "graph_id")
+    pid = _coerce_id(project_id, "project_id")
+    row = {
+        "graph_id": gid,
+        "project_id": pid,
+        "data": data,
+        "updated_at": _now(),
+    }
+    client().table(GRAPHS_TABLE).upsert(row, on_conflict="graph_id").execute()
+
+
+def get_graph(graph_id: Any) -> Optional[Dict[str, Any]]:
+    gid = _coerce_id(graph_id, "graph_id")
+    res = client().table(GRAPHS_TABLE).select("data").eq("graph_id", gid).limit(1).execute()
+    rows = res.data or []
+    if not rows:
+        return None
+    return rows[0].get("data") or None
+
+
+# ---------------------------------------------------------------------------
+# Tasks
+# ---------------------------------------------------------------------------
+def save_task(task_id: Any, state: Dict[str, Any]) -> None:
+    tid = _coerce_id(task_id, "task_id")
+    row = {
+        "task_id": tid,
+        "state": state,
+        "updated_at": _now(),
+    }
     try:
-        project_id = _coerce_project_id(
-            payload.get("project_id") or payload.get("project") or payload
-        )
-    except ValueError as e:
-        return jsonify({"success": False, "error": str(e)}), 400
-
-    proj = get_project(project_id)
-    if not proj:
-        return jsonify({"success": False, "error": "api.projectNotFound"}), 404
-
-    task_id = str(uuid.uuid4())
-    _set_task(
-        task_id,
-        status="pending",
-        progress=0,
-        message="queued",
-        project_id=project_id,
-        error=None,
-    )
-
-    t = threading.Thread(
-        target=_run_build,
-        args=(task_id, project_id),
-        daemon=True,
-    )
-    t.start()
-
-    return jsonify(
-        {
-            "success": True,
-            "data": {"task_id": task_id, "project_id": project_id},
-        }
-    )
-
-
-@bp.get("/api/graph/task/<task_id>")
-def graph_task(task_id: str):
-    """輪詢 task 狀態。找不到也回 JSON,不要讓 Flask 回 HTML 404。"""
-    state = _get_task(task_id)
-    if not state:
-        return (
-            jsonify(
-                {
-                    "success": False,
-                    "error": "task_not_found",
-                    "data": {"task_id": task_id, "status": "unknown"},
-                }
-            ),
-            404,
-        )
-    return jsonify({"success": True, "data": state})
-
-
-@bp.get("/api/graph/data/<graph_id>")
-def graph_data(graph_id: str):
-    """讀取已建好的 graph。實際資料來源請接你現有的 store。"""
-    try:
-        # TODO: 換成你真正的 graph 取出邏輯
-        from .graph_builder import load_graph  # 若沒有就改成你的實作
-        data = load_graph(graph_id)
-        if not data:
-            return jsonify({"success": False, "error": "graph_not_found"}), 404
-        return jsonify({"success": True, "data": data})
+        client().table(TASKS_TABLE).upsert(row, on_conflict="task_id").execute()
     except Exception as e:
-        log.exception("graph_data failed")
-        return jsonify({"success": False, "error": str(e)}), 500
+        log.warning("save_task failed: %s", e)
 
 
-# ---------------------------------------------------------------------------
-# Blueprint registration helper
-# ---------------------------------------------------------------------------
-def register(app) -> None:
-    """在 create_app 裡呼叫: register(app)"""
-    app.register_blueprint(bp)
+def get_task(task_id: Any) -> Optional[Dict[str, Any]]:
+    tid = _coerce_id(task_id, "task_id")
+    try:
+        res = client().table(TASKS_TABLE).select("state").eq("task_id", tid).limit(1).execute()
+        rows = res.data or []
+        if not rows:
+            return None
+        return rows[0].get("state") or None
+    except Exception as e:
+        log.warning("get_task failed: %s", e)
+        return None
+
+
+__all__ = [
+    "client",
+    "save_project",
+    "get_project",
+    "list_projects",
+    "delete_project",
+    "save_extracted_text",
+    "get_extracted_text",
+    "save_graph",
+    "get_graph",
+    "save_task",
+    "get_task",
+]
 
