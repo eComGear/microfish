@@ -19,6 +19,18 @@ from ..utils.locale import t, get_locale, set_locale
 
 logger = get_logger('mirofish.api.report')
 
+# Best-effort Supabase persistence (no-op if env vars missing)
+try:
+    from ..supabase_store import (
+        save_report as _sb_save_report,
+        get_report as _sb_get_report,
+        get_report_by_simulation as _sb_get_report_by_sim,
+    )
+except Exception:  # pragma: no cover
+    def _sb_save_report(*a, **k): return None
+    def _sb_get_report(*a, **k): return None
+    def _sb_get_report_by_sim(*a, **k): return None
+
 
 # ============== 报告生成接口 ==============
 
@@ -158,6 +170,12 @@ def generate_report():
                 
                 # 保存报告
                 ReportManager.save_report(report)
+
+                # Mirror to Supabase for fast cross-restart retrieval
+                try:
+                    _sb_save_report(report.to_dict())
+                except Exception as _e:
+                    logger.warning(f"Supabase save_report failed (ignored): {_e}")
                 
                 if report.status == ReportStatus.COMPLETED:
                     task_manager.complete_task(
@@ -295,18 +313,22 @@ def get_report(report_id: str):
     """
     try:
         report = ReportManager.get_report(report_id)
-        
+
         if not report:
+            # Fallback: try Supabase mirror
+            sb = _sb_get_report(report_id)
+            if sb:
+                return jsonify({"success": True, "data": sb, "source": "supabase"})
             return jsonify({
                 "success": False,
                 "error": t('api.reportNotFound', id=report_id)
             }), 404
-        
+
         return jsonify({
             "success": True,
             "data": report.to_dict()
         })
-        
+
     except Exception as e:
         logger.error(f"获取报告失败: {str(e)}")
         return jsonify({
@@ -332,14 +354,23 @@ def get_report_by_simulation(simulation_id: str):
     """
     try:
         report = ReportManager.get_report_by_simulation(simulation_id)
-        
+
         if not report:
+            # Fallback: try Supabase mirror
+            sb = _sb_get_report_by_sim(simulation_id)
+            if sb:
+                return jsonify({
+                    "success": True,
+                    "data": sb,
+                    "has_report": True,
+                    "source": "supabase",
+                })
             return jsonify({
                 "success": False,
                 "error": t('api.noReportForSim', id=simulation_id),
                 "has_report": False
             }), 404
-        
+
         return jsonify({
             "success": True,
             "data": report.to_dict(),
@@ -1018,3 +1049,4 @@ def get_graph_statistics_tool():
             "error": str(e),
             "traceback": traceback.format_exc()
         }), 500
+
