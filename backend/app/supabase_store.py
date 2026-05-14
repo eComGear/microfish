@@ -7,6 +7,8 @@ import os
 import json
 import logging
 from typing import Any, Optional
+from urllib.parse import urlparse, urlunparse
+
 from supabase import create_client, Client
 
 log = logging.getLogger(__name__)
@@ -14,16 +16,53 @@ log = logging.getLogger(__name__)
 _client: Optional[Client] = None
 
 
+def _normalize_supabase_url(raw_url: str) -> str:
+    """Return the Supabase project root URL expected by supabase-py.
+
+    Fly secrets are sometimes set to the PostgREST endpoint, for example:
+        https://<project>.supabase.co/rest/v1
+
+    supabase-py expects only:
+        https://<project>.supabase.co
+
+    If /rest/v1 is left in SUPABASE_URL, supabase-py appends another
+    /rest/v1 internally and PostgREST returns PGRST125:
+    "Invalid path specified in request URL".
+    """
+    url = (raw_url or "").strip().rstrip("/")
+    if not url:
+        return url
+
+    parsed = urlparse(url)
+    if not parsed.scheme or not parsed.netloc:
+        return url
+
+    path = parsed.path.rstrip("/")
+    marker = "/rest/v1"
+    if path == marker or path.endswith(marker) or f"{marker}/" in path:
+        path = path.split(marker, 1)[0]
+
+    normalized = urlunparse((parsed.scheme, parsed.netloc, path.rstrip("/"), "", "", ""))
+    return normalized.rstrip("/")
+
+
 def client() -> Client:
     """Lazy singleton Supabase client using the service-role key."""
     global _client
     if _client is None:
-        url = os.environ.get("SUPABASE_URL")
+        raw_url = os.environ.get("SUPABASE_URL")
         key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
-        if not url or not key:
+        if not raw_url or not key:
             raise RuntimeError(
                 "SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set"
             )
+
+        url = _normalize_supabase_url(raw_url)
+        if url != raw_url.strip().rstrip("/"):
+            log.warning(
+                "SUPABASE_URL contained a PostgREST path; normalized it to the Supabase project root"
+            )
+
         _client = create_client(url, key)
         log.info(f"Supabase client initialized: {url}")
     return _client
@@ -54,7 +93,7 @@ def upsert_project(project: dict) -> None:
 
     log.info(f"upsert_project: {pid} (cols={list(row.keys())})")
     try:
-        res = client().table("engine_projects").upsert(row, on_conflict="project_id").execute()
+        client().table("engine_projects").upsert(row, on_conflict="project_id").execute()
         log.info(f"upsert_project OK: {pid}")
     except Exception as e:
         log.error(f"upsert_project FAILED for {pid}: {e}")
