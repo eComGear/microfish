@@ -1,20 +1,24 @@
-# Single image used for BOTH the API and the worker.
-# fly.api.toml runs `node dist/api/server.js`.
-# fly.worker.toml is a no-op machine app; spawnWorkerMachine sets cmd dynamically.
+FROM python:3.11-slim
 
-FROM node:20-slim AS build
 WORKDIR /app
-COPY package.json ./
-RUN npm install --omit=dev=false
-COPY tsconfig.json ./
-COPY src ./src
-RUN npx tsc -p tsconfig.json
 
-FROM node:20-slim
-WORKDIR /app
-ENV NODE_ENV=production
-COPY --from=build /app/node_modules ./node_modules
-COPY --from=build /app/dist ./dist
-COPY package.json ./
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends build-essential curl \
+  && rm -rf /var/lib/apt/lists/*
+
+COPY backend/requirements.txt ./backend/requirements.txt
+RUN pip install --no-cache-dir -r backend/requirements.txt
+
+COPY backend ./backend
+
+WORKDIR /app/backend
+
+ENV HOST=0.0.0.0
+ENV PORT=8080
+ENV FLASK_PORT=8080
+ENV PYTHONUNBUFFERED=1
+
 EXPOSE 8080
-CMD ["node", "dist/api/server.js"]
+
+CMD ["python", "run.py"]
+
