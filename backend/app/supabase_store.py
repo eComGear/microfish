@@ -1,6 +1,5 @@
 # backend/app/supabase_store.py
 import os
-import json
 import logging
 from typing import Any, Optional
 from supabase import create_client, Client
@@ -14,12 +13,14 @@ REPORTS_TABLE = "engine_reports"
 
 PROJECT_COLUMNS = {
     "project_id", "name", "status", "files",
-    "total_text_length", "ontology", "graph_id",
-    "created_at", "updated_at",
+    "total_text_length", "ontology", "analysis_summary",
+    "graph_id", "graph_build_task_id",
+    "simulation_requirement", "chunk_size", "chunk_overlap",
+    "error", "created_at", "updated_at",
 }
 SIMULATION_COLUMNS = {
     "simulation_id", "project_id", "graph_id", "status",
-    "config", "created_at", "updated_at",
+    "config", "error", "created_at", "updated_at",
 }
 EXTRACTED_TEXT_COLUMNS = {
     "project_id", "source_id", "content", "metadata",
@@ -42,17 +43,20 @@ def client() -> Client:
     global _client
     if _client is None:
         url = _normalize_supabase_url(os.environ["SUPABASE_URL"])
-        key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ["SUPABASE_KEY"]
+        key = (
+            os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+            or os.environ.get("SUPABASE_KEY")
+            or ""
+        )
+        if not url or not key:
+            raise RuntimeError("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY (or SUPABASE_KEY) must be set")
         _client = create_client(url, key)
     return _client
 
 
 def _coerce_id(value: Any, field: str) -> str:
-    """Guard: never let a dict/list become the primary key."""
-    if isinstance(value, (dict, list)):
+    if isinstance(value, (dict, list)) or value is None:
         raise ValueError(f"{field} must be a string, got {type(value).__name__}: {value!r}")
-    if value is None:
-        raise ValueError(f"{field} is required")
     return str(value)
 
 
@@ -62,14 +66,25 @@ def _filter(payload: dict, allowed: set) -> dict:
 
 # ---------------- projects ----------------
 
-def upsert_project(project_id: str, **fields) -> dict:
-    pid = _coerce_id(project_id, "project_id")
-    # If caller accidentally passed the whole payload as project_id, unpack it.
-    if isinstance(project_id, dict):  # extra safety
-        fields = {**project_id, **fields}
-        pid = _coerce_id(fields.pop("project_id", None), "project_id")
+def upsert_project(project_id, *args, **fields) -> dict:
+    """
+    Tolerates caller shapes:
+      upsert_project("proj_xxx", name=..., status=...)
+      upsert_project({"project_id": "proj_xxx", "name": ..., ...})
+      upsert_project("proj_xxx", {"name": ..., ...})
+    """
+    if isinstance(project_id, dict):
+        merged = {**project_id, **fields}
+        pid = merged.pop("project_id", None)
+    else:
+        pid = project_id
+        merged = dict(fields)
+        if args and isinstance(args[0], dict):
+            merged = {**args[0], **merged}
 
-    row = _filter({**fields, "project_id": pid}, PROJECT_COLUMNS)
+    pid = _coerce_id(pid, "project_id")
+
+    row = _filter({**merged, "project_id": pid}, PROJECT_COLUMNS)
     try:
         client().table(PROJECTS_TABLE).upsert(row, on_conflict="project_id").execute()
     except Exception as e:
@@ -87,7 +102,7 @@ def upsert_project(project_id: str, **fields) -> dict:
     return (res.data or [{}])[0]
 
 
-def get_project(project_id: str) -> Optional[dict]:
+def get_project(project_id) -> Optional[dict]:
     pid = _coerce_id(project_id, "project_id")
     res = (
         client()
@@ -102,18 +117,31 @@ def get_project(project_id: str) -> Optional[dict]:
 
 # ---------------- simulations ----------------
 
-def upsert_simulation(simulation_id: str, **fields) -> dict:
-    sid = _coerce_id(simulation_id, "simulation_id")
-    if "project_id" in fields:
-        fields["project_id"] = _coerce_id(fields["project_id"], "project_id")
+def upsert_simulation(simulation_id, *args, **fields) -> dict:
+    if isinstance(simulation_id, dict):
+        merged = {**simulation_id, **fields}
+        sid = merged.pop("simulation_id", None)
+    else:
+        sid = simulation_id
+        merged = dict(fields)
+        if args and isinstance(args[0], dict):
+            merged = {**args[0], **merged}
 
-    row = _filter({**fields, "simulation_id": sid}, SIMULATION_COLUMNS)
-    client().table(SIMULATIONS_TABLE).upsert(row, on_conflict="simulation_id").execute()
+    sid = _coerce_id(sid, "simulation_id")
+    if "project_id" in merged and merged["project_id"] is not None:
+        merged["project_id"] = _coerce_id(merged["project_id"], "project_id")
+
+    row = _filter({**merged, "simulation_id": sid}, SIMULATION_COLUMNS)
+    try:
+        client().table(SIMULATIONS_TABLE).upsert(row, on_conflict="simulation_id").execute()
+    except Exception as e:
+        log.error("upsert_simulation FAILED for %s: %s", sid, e)
+        raise
 
     res = (
         client()
         .table(SIMULATIONS_TABLE)
-        .select("simulation_id, project_id, graph_id, status, created_at, updated_at, config")
+        .select("*")
         .eq("simulation_id", sid)
         .limit(1)
         .execute()
@@ -121,12 +149,12 @@ def upsert_simulation(simulation_id: str, **fields) -> dict:
     return (res.data or [{}])[0]
 
 
-def get_simulation(simulation_id: str) -> Optional[dict]:
+def get_simulation(simulation_id) -> Optional[dict]:
     sid = _coerce_id(simulation_id, "simulation_id")
     res = (
         client()
         .table(SIMULATIONS_TABLE)
-        .select("simulation_id, project_id, graph_id, status, created_at, updated_at, config")
+        .select("*")
         .eq("simulation_id", sid)
         .limit(1)
         .execute()
@@ -136,10 +164,10 @@ def get_simulation(simulation_id: str) -> Optional[dict]:
 
 # ---------------- extracted texts ----------------
 
-def save_extracted_text(project_id: str, content: str = "", **kwargs) -> dict:
+def save_extracted_text(project_id, content: str = "", **kwargs) -> dict:
     # tolerate text= alias
     if "text" in kwargs and not content:
-        content = kwargs.pop("text")
+        content = kwargs.pop("text") or ""
     pid = _coerce_id(project_id, "project_id")
     row = _filter(
         {
@@ -150,11 +178,15 @@ def save_extracted_text(project_id: str, content: str = "", **kwargs) -> dict:
         },
         EXTRACTED_TEXT_COLUMNS,
     )
-    client().table(EXTRACTED_TEXTS_TABLE).insert(row).execute()
+    try:
+        client().table(EXTRACTED_TEXTS_TABLE).insert(row).execute()
+    except Exception as e:
+        log.error("save_extracted_text FAILED for %s: %s", pid, e)
+        raise
     return row
 
 
-def get_extracted_text(project_id: str) -> list[dict]:
+def get_extracted_text(project_id) -> list[dict]:
     pid = _coerce_id(project_id, "project_id")
     res = (
         client()
