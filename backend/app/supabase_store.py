@@ -1,9 +1,8 @@
-"""Supabase storage layer for MiroFish backend.
+"""
+Supabase storage helpers for MiroFish backend.
 
-All reads use .limit(1).execute() instead of .single() / .maybe_single() to
-avoid PGRST125 ("Invalid path specified in request URL") seen in some
-supabase-py versions. All writes filter to known columns and re-read after
-upsert to confirm the row landed.
+All reads use .limit(1).execute() instead of .single()/.maybe_single() to avoid
+PGRST116 noise. All writes upsert and then re-read to verify the row landed.
 """
 
 from __future__ import annotations
@@ -17,14 +16,22 @@ from supabase import Client, create_client
 
 logger = logging.getLogger(__name__)
 
-# ---------- client ----------
+# ---------------------------------------------------------------------------
+# Client
+# ---------------------------------------------------------------------------
 
 _client: Optional[Client] = None
 
 
 def _normalize_supabase_url(raw_url: str) -> str:
-    """Strip trailing /rest/v1 if present — supabase-py appends it itself."""
+    """
+    supabase-py expects https://<project>.supabase.co (no /rest/v1 suffix).
+    If the env var was misconfigured with /rest/v1, strip it; otherwise PostgREST
+    returns PGRST125 'Invalid path specified in request URL'.
+    """
     url = (raw_url or "").strip().rstrip("/")
+    if not url:
+        return url
     parsed = urlparse(url)
     if not parsed.scheme or not parsed.netloc:
         return url
@@ -32,52 +39,89 @@ def _normalize_supabase_url(raw_url: str) -> str:
     marker = "/rest/v1"
     if path == marker or path.endswith(marker) or f"{marker}/" in path:
         path = path.split(marker, 1)[0]
-    normalized = urlunparse((parsed.scheme, parsed.netloc, path.rstrip("/"), "", "", ""))
-    return normalized.rstrip("/")
+    normalized = urlunparse(
+        (parsed.scheme, parsed.netloc, path.rstrip("/"), "", "", "")
+    )
+    normalized = normalized.rstrip("/")
+    if normalized != url:
+        logger.warning(
+            f"SUPABASE_URL normalized: {url!r} -> {normalized!r} (stripped /rest/v1)"
+        )
+    return normalized
 
 
 def client() -> Client:
     global _client
     if _client is not None:
         return _client
+
     raw_url = os.environ.get("SUPABASE_URL", "")
-    key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("SUPABASE_KEY", "")
+    key = (
+        os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+        or os.environ.get("SUPABASE_SERVICE_KEY")
+        or os.environ.get("SUPABASE_KEY", "")
+    )
     url = _normalize_supabase_url(raw_url)
-    if url != raw_url:
-        logger.warning(f"SUPABASE_URL normalized: {raw_url!r} -> {url!r}")
     if not url or not key:
-        raise RuntimeError("SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY not set")
+        raise RuntimeError(
+            "Supabase env missing: need SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY"
+        )
+
     _client = create_client(url, key)
+    logger.info(f"Supabase client initialized url={url}")
     return _client
 
 
-# ---------- column whitelists ----------
+# ---------------------------------------------------------------------------
+# Column whitelists  (only fields we actually persist)
+# ---------------------------------------------------------------------------
 
 PROJECT_COLUMNS = {
-    "project_id", "name", "description", "status",
-    "ontology", "analysis_summary", "files",
-    "simulation_requirement", "additional_context",
-    "total_text_length", "graph_id",
-    "created_at", "updated_at",
+    "project_id",
+    "user_id",
+    "name",
+    "title",
+    "description",
+    "status",
+    "graph_id",
+    "metadata",
+    "created_at",
+    "updated_at",
 }
 
 SIMULATION_COLUMNS = {
-    "simulation_id", "project_id", "graph_id", "name", "status",
-    "num_agents", "num_rounds", "current_round", "config",
-    "enable_twitter", "enable_reddit",
-    "created_at", "updated_at",
+    "simulation_id",
+    "project_id",
+    "graph_id",
+    "name",
+    "title",
+    "status",
+    "config",
+    "result",
+    "metadata",
+    "created_at",
+    "updated_at",
 }
 
 EXTRACTED_TEXT_COLUMNS = {
-    "project_id", "filename", "content", "size", "created_at",
+    "project_id",
+    "source_id",
+    "content",
+    "text",
+    "metadata",
+    "created_at",
+    "updated_at",
 }
 
 
-def _filter(row: dict, allowed: set[str]) -> dict:
-    return {k: v for k, v in (row or {}).items() if k in allowed and v is not None}
+def _filter(payload: dict, allowed: set[str]) -> dict:
+    return {k: v for k, v in (payload or {}).items() if k in allowed and v is not None}
 
 
-# ---------- projects ----------
+# ---------------------------------------------------------------------------
+# Projects
+# ---------------------------------------------------------------------------
+
 
 def upsert_project(row: dict) -> dict:
     pid = (row or {}).get("project_id")
@@ -85,103 +129,83 @@ def upsert_project(row: dict) -> dict:
         raise ValueError(f"upsert_project: invalid project_id={pid!r}")
 
     payload = _filter(row, PROJECT_COLUMNS)
-    payload["project_id"] = pid
-
-    logger.info(f"upsert_project -> {pid} keys={list(payload.keys())}")
     try:
-        res = (
+        client().table("projects").upsert(payload, on_conflict="project_id").execute()
+        check = (
             client()
-            .table("engine_projects")
-            .upsert(payload, on_conflict="project_id")
+            .table("projects")
+            .select("*")
+            .eq("project_id", pid)
+            .limit(1)
             .execute()
         )
-        data = res.data or []
-        if not data:
-            check = (
-                client()
-                .table("engine_projects")
-                .select("*")
-                .eq("project_id", pid)
-                .limit(1)
-                .execute()
+        if not check.data:
+            raise RuntimeError(
+                f"upsert_project: row not visible after write project_id={pid}"
             )
-            data = check.data or []
-        if not data:
-            raise RuntimeError(f"upsert_project: row not visible after write pid={pid}")
         logger.info(f"upsert_project OK {pid}")
-        return data[0]
+        return check.data[0]
     except Exception as e:
-        logger.error(f"upsert_project FAILED {pid}: {e}")
+        logger.error(f"upsert_project FAILED for {pid}: {e}")
         raise
 
 
 def get_project(project_id: str) -> Optional[dict]:
     if not isinstance(project_id, str) or not project_id:
-        logger.warning(f"get_project: invalid id={project_id!r}")
         return None
-    logger.info(f"get_project -> {project_id}")
     try:
         res = (
             client()
-            .table("engine_projects")
+            .table("projects")
             .select("*")
             .eq("project_id", project_id)
             .limit(1)
             .execute()
         )
         rows = res.data or []
-        if not rows:
-            logger.warning(f"get_project: NOT FOUND {project_id}")
-            return None
-        return rows[0]
+        return rows[0] if rows else None
     except Exception as e:
         logger.error(f"get_project FAILED {project_id}: {e}")
-        raise
+        return None
 
 
-# ---------- simulations ----------
+# ---------------------------------------------------------------------------
+# Simulations
+# ---------------------------------------------------------------------------
+
 
 def upsert_simulation(row: dict) -> dict:
-    sid = (row or {}).get("simulation_id")
-    if not isinstance(sid, str) or not sid:
-        raise ValueError(f"upsert_simulation: invalid simulation_id={sid!r}")
+    sim_id = (row or {}).get("simulation_id")
+    if not isinstance(sim_id, str) or not sim_id:
+        raise ValueError(f"upsert_simulation: invalid simulation_id={sim_id!r}")
 
     payload = _filter(row, SIMULATION_COLUMNS)
-    payload["simulation_id"] = sid
-
-    logger.info(f"upsert_simulation -> {sid} keys={list(payload.keys())}")
     try:
-        res = (
+        client().table("engine_simulations").upsert(
+            payload, on_conflict="simulation_id"
+        ).execute()
+        check = (
             client()
             .table("engine_simulations")
-            .upsert(payload, on_conflict="simulation_id")
+            .select("*")
+            .eq("simulation_id", sim_id)
+            .limit(1)
             .execute()
         )
-        data = res.data or []
-        if not data:
-            check = (
-                client()
-                .table("engine_simulations")
-                .select("*")
-                .eq("simulation_id", sid)
-                .limit(1)
-                .execute()
+        if not check.data:
+            raise RuntimeError(
+                f"upsert_simulation: row not visible after write sim_id={sim_id}"
             )
-            data = check.data or []
-        if not data:
-            raise RuntimeError(f"upsert_simulation: row not visible after write sid={sid}")
-        logger.info(f"upsert_simulation OK {sid}")
-        return data[0]
+        logger.info(f"upsert_simulation OK {sim_id}")
+        return check.data[0]
     except Exception as e:
-        logger.error(f"upsert_simulation FAILED {sid}: {e}")
+        logger.error(f"upsert_simulation FAILED {sim_id}: {e}")
         raise
 
 
 def get_simulation(simulation_id: str) -> Optional[dict]:
     if not isinstance(simulation_id, str) or not simulation_id:
-        logger.warning(f"get_simulation: invalid id={simulation_id!r}")
         return None
-    logger.info(f"get_simulation -> {simulation_id}")
     try:
         res = (
             client()
@@ -193,59 +217,92 @@ def get_simulation(simulation_id: str) -> Optional[dict]:
         )
         rows = res.data or []
         if not rows:
-            logger.warning(f"get_simulation: NOT FOUND {simulation_id}")
+            logger.warning(f"get_simulation: not found {simulation_id}")
             return None
         return rows[0]
     except Exception as e:
         logger.error(f"get_simulation FAILED {simulation_id}: {e}")
-        raise
+        return None
 
 
-# ---------- extracted text ----------
-
-def save_extracted_text(project_id: str, filename: str, content: str, size: int = 0) -> dict:
-    if not project_id or not filename:
-        raise ValueError(f"save_extracted_text: bad args pid={project_id!r} fn={filename!r}")
-    payload = {
-        "project_id": project_id,
-        "filename": filename,
-        "content": content,
-        "size": size or len(content or ""),
-    }
-    logger.info(f"save_extracted_text -> {project_id}/{filename} size={payload['size']}")
-    try:
-        res = client().table("engine_extracted_texts").insert(payload).execute()
-        data = res.data or []
-        if not data:
-            raise RuntimeError(f"save_extracted_text: no row returned for {project_id}/{filename}")
-        return data[0]
-    except Exception as e:
-        logger.error(f"save_extracted_text FAILED {project_id}/{filename}: {e}")
-        raise
-
-
-def get_extracted_text(project_id: str) -> list[dict]:
-    if not project_id:
+def list_simulations_for_project(project_id: str, limit: int = 50) -> list[dict]:
+    if not isinstance(project_id, str) or not project_id:
         return []
     try:
         res = (
             client()
-            .table("engine_extracted_texts")
+            .table("engine_simulations")
             .select("*")
             .eq("project_id", project_id)
+            .order("created_at", desc=True)
+            .limit(limit)
             .execute()
         )
         return res.data or []
     except Exception as e:
-        logger.error(f"get_extracted_text FAILED {project_id}: {e}")
+        logger.error(f"list_simulations_for_project FAILED {project_id}: {e}")
+        return []
+
+
+# ---------------------------------------------------------------------------
+# Extracted text
+# ---------------------------------------------------------------------------
+
+
+def save_extracted_text(project_id: str, content: str = "", **kwargs: Any) -> dict:
+    """
+    Backwards-compatible signature:
+        save_extracted_text(project_id, content)
+        save_extracted_text(project_id=..., content=..., source_id=..., metadata=...)
+        save_extracted_text(project_id)                # content defaults to ""
+        save_extracted_text(project_id, text="...")    # tolerate text= kwarg
+    """
+    if not isinstance(project_id, str) or not project_id:
+        raise ValueError(f"save_extracted_text: invalid project_id={project_id!r}")
+
+    if not content and "text" in kwargs:
+        content = kwargs.pop("text") or ""
+
+    payload: dict = {"project_id": project_id, "content": content or ""}
+    for k, v in kwargs.items():
+        if k in EXTRACTED_TEXT_COLUMNS and v is not None:
+            payload[k] = v
+
+    try:
+        client().table("extracted_texts").upsert(
+            payload, on_conflict="project_id"
+        ).execute()
+        check = (
+            client()
+            .table("extracted_texts")
+            .select("*")
+            .eq("project_id", project_id)
+            .limit(1)
+            .execute()
+        )
+        logger.info(
+            f"save_extracted_text OK project={project_id} len={len(payload['content'])}"
+        )
+        return (check.data or [{}])[0]
+    except Exception as e:
+        logger.error(f"save_extracted_text FAILED project={project_id}: {e}")
         raise
 
 
-__all__ = [
-    "client",
-    "upsert_project", "get_project",
-    "upsert_simulation", "get_simulation",
-    "save_extracted_text", "get_extracted_text",
-]
-
-
+def get_extracted_text(project_id: str) -> Optional[dict]:
+    if not isinstance(project_id, str) or not project_id:
+        return None
+    try:
+        res = (
+            client()
+            .table("extracted_texts")
+            .select("*")
+            .eq("project_id", project_id)
+            .limit(1)
+            .execute()
+        )
+        rows = res.data or []
+        return rows[0] if rows else None
+    except Exception as e:
+        logger.error(f"get_extracted_text FAILED project={project_id}: {e}")
+        return None
