@@ -248,3 +248,4 @@ __all__ = [
     "save_extracted_text", "get_extracted_text",
 ]
 
+
