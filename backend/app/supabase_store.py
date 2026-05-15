@@ -1,164 +1,276 @@
+# backend/app/supabase_store.py
 """
-Supabase persistence for the MicroFish engine.
-
-Two tables (separate from the frontend's `reports` table to avoid coupling):
-  - engine_simulations  (one row per simulation_id, full state snapshot)
-  - engine_reports      (one row per report_id, with simulation_id index)
-
-All functions are best-effort: if env vars or the supabase package are
-missing, every call becomes a no-op and returns None — the engine keeps
-running on local disk.
+Supabase persistence layer for MicroFish backend.
+Self-contained: does NOT import from app.models or any sibling that imports back.
 """
 from __future__ import annotations
 
-import logging
 import os
-from typing import Any, Dict, Optional
+import json
+import logging
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
+
+from supabase import create_client, Client
 
 log = logging.getLogger(__name__)
 
-_SB = None
-_INIT_TRIED = False
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
+SUPABASE_KEY = (
+    os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+    or os.environ.get("SUPABASE_KEY")
+    or os.environ.get("SUPABASE_ANON_KEY")
+    or ""
+)
+
+PROJECTS_TABLE = os.environ.get("SB_PROJECTS_TABLE", "engine_projects")
+EXTRACTED_TEXTS_TABLE = os.environ.get("SB_EXTRACTED_TEXTS_TABLE", "engine_extracted_texts")
+GRAPHS_TABLE = os.environ.get("SB_GRAPHS_TABLE", "engine_graphs")
+TASKS_TABLE = os.environ.get("SB_TASKS_TABLE", "engine_tasks")
+
+_client: Optional[Client] = None
 
 
-def _client():
-    """Lazy singleton. Returns None if Supabase isn't configured."""
-    global _SB, _INIT_TRIED
-    if _SB is not None or _INIT_TRIED:
-        return _SB
-    _INIT_TRIED = True
-    url = os.environ.get("SUPABASE_URL")
-    key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
-    if not url or not key:
-        log.info("supabase_store: SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY not set — persistence disabled")
-        return None
-    try:
-        from supabase import create_client  # type: ignore
-        _SB = create_client(url, key)
-        log.info("supabase_store: client initialized")
-    except Exception as e:  # noqa: BLE001
-        log.warning("supabase_store: failed to init client: %s", e)
-        _SB = None
-    return _SB
+def client() -> Client:
+    global _client
+    if _client is None:
+        if not SUPABASE_URL or not SUPABASE_KEY:
+            raise RuntimeError("SUPABASE_URL / SUPABASE_KEY env not set")
+        _client = create_client(SUPABASE_URL, SUPABASE_KEY)
+    return _client
 
 
-# ---------- simulations ----------
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
-def upsert_simulation(state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Mirror a simulation state dict to Supabase. Keyed by simulation_id."""
-    sb = _client()
-    if sb is None or not isinstance(state, dict):
-        return None
-    sim_id = state.get("simulation_id") or state.get("id")
-    if not sim_id:
-        return None
+
+def _as_text(v: Any) -> str:
+    """Coerce any stored value to a plain string. Prevents '.strip on list' errors."""
+    if v is None:
+        return ""
+    if isinstance(v, str):
+        return v
+    if isinstance(v, (list, tuple)):
+        parts = []
+        for item in v:
+            parts.append(_as_text(item))
+        return "\n\n".join(p for p in parts if p)
+    if isinstance(v, dict):
+        for k in ("content", "text", "extracted_text", "value"):
+            if k in v:
+                return _as_text(v[k])
+        try:
+            return json.dumps(v, ensure_ascii=False)
+        except Exception:
+            return str(v)
+    return str(v)
+
+
+def _coerce_id(value: Any, name: str = "id") -> str:
+    """Accept str OR dict({'project_id': '...'}) — normalize to str."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        for k in (name, "id", "project_id", "graph_id", "task_id"):
+            if k in value and isinstance(value[k], str):
+                return value[k]
+    raise TypeError(f"{name} must be a string, got {type(value).__name__}: {value!r}")
+
+
+# ---------------------------------------------------------------------------
+# Projects
+# ---------------------------------------------------------------------------
+def save_project(project: Dict[str, Any]) -> Dict[str, Any]:
+    pid = _coerce_id(project.get("project_id") or project.get("id"), "project_id")
     row = {
-        "simulation_id": str(sim_id),
-        "status": state.get("status"),
-        "topic": state.get("topic"),
-        "user_id": state.get("user_id"),
-        "state": state,  # full snapshot in jsonb
+        "project_id": pid,
+        "name": project.get("name"),
+        "status": project.get("status", "created"),
+        "data": project,
+        "updated_at": _now(),
+    }
+    if "created_at" not in project:
+        row["created_at"] = _now()
+    client().table(PROJECTS_TABLE).upsert(row, on_conflict="project_id").execute()
+    return project
+
+
+def get_project(project_id: Any) -> Optional[Dict[str, Any]]:
+    pid = _coerce_id(project_id, "project_id")
+    res = client().table(PROJECTS_TABLE).select("data").eq("project_id", pid).limit(1).execute()
+    rows = res.data or []
+    if not rows:
+        return None
+    return rows[0].get("data") or None
+
+
+def list_projects() -> List[Dict[str, Any]]:
+    res = (
+        client()
+        .table(PROJECTS_TABLE)
+        .select("data")
+        .order("updated_at", desc=True)
+        .execute()
+    )
+    return [r["data"] for r in (res.data or []) if r.get("data")]
+
+
+def delete_project(project_id: Any) -> None:
+    pid = _coerce_id(project_id, "project_id")
+    client().table(PROJECTS_TABLE).delete().eq("project_id", pid).execute()
+    client().table(EXTRACTED_TEXTS_TABLE).delete().eq("project_id", pid).execute()
+
+
+# ---------------------------------------------------------------------------
+# Extracted texts
+# ---------------------------------------------------------------------------
+def save_extracted_text(
+    project_id: Any,
+    content: Any,
+    source_id: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> None:
+    pid = _coerce_id(project_id, "project_id")
+    text = _as_text(content)
+    row = {
+        "project_id": pid,
+        "source_id": source_id or "default",
+        "content": text,
+        "metadata": metadata or {},
+        "created_at": _now(),
     }
     try:
-        res = sb.table("engine_simulations").upsert(row, on_conflict="simulation_id").execute()
-        return (res.data or [None])[0]
-    except Exception as e:  # noqa: BLE001
-        log.warning("supabase_store.upsert_simulation failed: %s", e)
-        return None
+        client().table(EXTRACTED_TEXTS_TABLE).upsert(
+            row, on_conflict="project_id,source_id"
+        ).execute()
+    except Exception as e:
+        log.warning("upsert failed (%s); falling back to delete+insert", e)
+        client().table(EXTRACTED_TEXTS_TABLE).delete().eq("project_id", pid).eq(
+            "source_id", row["source_id"]
+        ).execute()
+        client().table(EXTRACTED_TEXTS_TABLE).insert(row).execute()
 
 
-def get_simulation(simulation_id: str) -> Optional[Dict[str, Any]]:
-    sb = _client()
-    if sb is None or not simulation_id:
-        return None
-    try:
-        res = (
-            sb.table("engine_simulations")
-            .select("state")
-            .eq("simulation_id", str(simulation_id))
-            .limit(1)
-            .execute()
-        )
-        rows = res.data or []
-        if not rows:
-            return None
-        return rows[0].get("state")
-    except Exception as e:  # noqa: BLE001
-        log.warning("supabase_store.get_simulation failed: %s", e)
-        return None
+def get_extracted_text(project_id: Any) -> str:
+    """Always returns a single concatenated string (never list/dict)."""
+    pid = _coerce_id(project_id, "project_id")
+    res = (
+        client()
+        .table(EXTRACTED_TEXTS_TABLE)
+        .select("content,created_at")
+        .eq("project_id", pid)
+        .order("created_at", desc=False)
+        .execute()
+    )
+    rows = res.data or []
+    if not rows:
+        return ""
+    parts = [_as_text(r.get("content")) for r in rows]
+    return "\n\n".join(p for p in parts if p)
 
 
-# ---------- reports ----------
-
-def save_report(report: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Upsert a report. Keyed by report_id."""
-    sb = _client()
-    if sb is None or not isinstance(report, dict):
-        return None
-    report_id = report.get("report_id") or report.get("id")
-    if not report_id:
-        return None
+# ---------------------------------------------------------------------------
+# Graphs
+# ---------------------------------------------------------------------------
+def save_graph(graph_id: Any, project_id: Any, data: Dict[str, Any]) -> None:
+    gid = _coerce_id(graph_id, "graph_id")
+    pid = _coerce_id(project_id, "project_id")
     row = {
-        "report_id": str(report_id),
-        "simulation_id": str(report.get("simulation_id") or ""),
-        "status": report.get("status"),
-        "title": report.get("title"),
-        "topic": report.get("topic"),
-        "markdown_content": report.get("markdown_content") or report.get("markdown"),
-        "outline": report.get("outline"),
-        "payload": report,  # full snapshot in jsonb
+        "graph_id": gid,
+        "project_id": pid,
+        "data": data,
+        "updated_at": _now(),
+    }
+    client().table(GRAPHS_TABLE).upsert(row, on_conflict="graph_id").execute()
+
+
+def get_graph(graph_id: Any) -> Optional[Dict[str, Any]]:
+    gid = _coerce_id(graph_id, "graph_id")
+    res = client().table(GRAPHS_TABLE).select("data").eq("graph_id", gid).limit(1).execute()
+    rows = res.data or []
+    if not rows:
+        return None
+    return rows[0].get("data") or None
+
+
+# ---------------------------------------------------------------------------
+# Tasks
+# ---------------------------------------------------------------------------
+def save_task(task_id: Any, state: Dict[str, Any]) -> None:
+    tid = _coerce_id(task_id, "task_id")
+    row = {
+        "task_id": tid,
+        "state": state,
+        "updated_at": _now(),
     }
     try:
-        res = sb.table("engine_reports").upsert(row, on_conflict="report_id").execute()
-        return (res.data or [None])[0]
-    except Exception as e:  # noqa: BLE001
-        log.warning("supabase_store.save_report failed: %s", e)
-        return None
+        client().table(TASKS_TABLE).upsert(row, on_conflict="task_id").execute()
+    except Exception as e:
+        log.warning("save_task failed: %s", e)
 
 
-def get_report(report_id: str) -> Optional[Dict[str, Any]]:
-    sb = _client()
-    if sb is None or not report_id:
-        return None
+def get_task(task_id: Any) -> Optional[Dict[str, Any]]:
+    tid = _coerce_id(task_id, "task_id")
     try:
-        res = (
-            sb.table("engine_reports")
-            .select("payload")
-            .eq("report_id", str(report_id))
-            .limit(1)
-            .execute()
-        )
+        res = client().table(TASKS_TABLE).select("state").eq("task_id", tid).limit(1).execute()
         rows = res.data or []
         if not rows:
             return None
-        return rows[0].get("payload")
-    except Exception as e:  # noqa: BLE001
-        log.warning("supabase_store.get_report failed: %s", e)
+        return rows[0].get("state") or None
+    except Exception as e:
+        log.warning("get_task failed: %s", e)
         return None
 
 
-def get_report_by_simulation(simulation_id: str) -> Optional[Dict[str, Any]]:
-    sb = _client()
-    if sb is None or not simulation_id:
-        return None
-    try:
-        res = (
-            sb.table("engine_reports")
-            .select("payload, created_at")
-            .eq("simulation_id", str(simulation_id))
-            .order("created_at", desc=True)
-            .limit(1)
-            .execute()
-        )
-        rows = res.data or []
-        if not rows:
-            return None
-        return rows[0].get("payload")
-    except Exception as e:  # noqa: BLE001
-        log.warning("supabase_store.get_report_by_simulation failed: %s", e)
-        return None
+__all__ = [
+    "client",
+    "save_project",
+    "get_project",
+    "list_projects",
+    "delete_project",
+    "save_extracted_text",
+    "get_extracted_text",
+    "save_graph",
+    "get_graph",
+    "save_task",
+    "get_task",
+]
 
+import hashlib, json
 
-# Back-compat aliases (old call sites)
-sb = _client
+def compute_input_hash(payload: dict) -> str:
+    canon = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(canon.encode("utf-8")).hexdigest()
 
+def get_cached_simulation(project_id: str, input_hash: str):
+    r = _client().table("simulations").select("*") \
+        .eq("project_id", project_id).eq("input_hash", input_hash) \
+        .maybe_single().execute()
+    return r.data if r and r.data else None
+
+def upsert_simulation(project_id: str, input_hash: str, *,
+                      config=None, result=None, status="pending", error=None):
+    row = {
+        "project_id": project_id,
+        "input_hash": input_hash,
+        "config": config,
+        "result": result,
+        "status": status,
+        "error": error,
+        "updated_at": "now()",
+    }
+    return _client().table("simulations").upsert(
+        row, on_conflict="project_id,input_hash"
+    ).execute()
+
+def list_simulations(project_id: str, limit: int = 50):
+    r = _client().table("simulations").select("*") \
+        .eq("project_id", project_id) \
+        .order("created_at", desc=True).limit(limit).execute()
+    return r.data or []

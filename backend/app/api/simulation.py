@@ -789,31 +789,21 @@ def get_simulation(simulation_id: str):
 
 @simulation_bp.route('/list', methods=['GET'])
 def list_simulations():
-    """
-    列出所有模拟
-    
-    Query参数：
-        project_id: 按项目ID过滤（可选）
-    """
     try:
         project_id = request.args.get('project_id')
-        
-        manager = SimulationManager()
-        simulations = manager.list_simulations(project_id=project_id)
-        
-        return jsonify({
-            "success": True,
-            "data": [s.to_dict() for s in simulations],
-            "count": len(simulations)
-        })
-        
+        if not project_id:
+            return jsonify({"success": False, "error": "project_id required"}), 400
+        from .. import supabase_store
+        rows = supabase_store.list_simulations(
+            project_id=project_id,
+            limit=int(request.args.get('limit') or 50),
+        )
+        return jsonify({"success": True, "data": rows, "count": len(rows)})
     except Exception as e:
-        logger.error(f"列出模拟失败: {str(e)}")
-        return jsonify({
-            "success": False,
-            "error": str(e),
-            "traceback": traceback.format_exc()
-        }), 500
+        logger.error(f"list simulations failed: {e}")
+        return jsonify({"success": False, "error": str(e),
+                        "traceback": traceback.format_exc()}), 500
+
 
 
 def _get_report_id_for_simulation(simulation_id: str) -> str:
@@ -1501,6 +1491,72 @@ def start_simulation():
                 "error": t('api.requireSimulationId')
             }), 400
 
+        # ---- Supabase cache lookup -------------------------------------
+        from .. import supabase_store
+        try:
+            sim_meta = supabase_store.client().table("simulations_meta") \
+                .select("project_id,graph_id,enable_twitter,enable_reddit") \
+                .eq("simulation_id", simulation_id).limit(1).execute().data
+            sim_meta = sim_meta[0] if sim_meta else {}
+        except Exception:
+            sim_meta = {}
+
+        # Fall back to SimulationManager metadata if Supabase row missing
+        if not sim_meta:
+            try:
+                _mgr = SimulationManager()
+                _s = _mgr.get_simulation(simulation_id)
+                if _s:
+                    _d = _s.to_dict()
+                    sim_meta = {
+                        "project_id": _d.get("project_id"),
+                        "graph_id": _d.get("graph_id"),
+                        "enable_twitter": _d.get("enable_twitter", True),
+                        "enable_reddit": _d.get("enable_reddit", False),
+                    }
+            except Exception:
+                pass
+
+        _project_id = sim_meta.get("project_id")
+        _cache_config = {
+            "project_id": _project_id,
+            "graph_id": sim_meta.get("graph_id"),
+            "platform": platform,
+            "max_rounds": max_rounds,
+            "enable_twitter": sim_meta.get("enable_twitter", True),
+            "enable_reddit": sim_meta.get("enable_reddit", False),
+        }
+        _input_hash = supabase_store.compute_input_hash(_cache_config) if _project_id else None
+
+        if _project_id and _input_hash and not force:
+            try:
+                cached = supabase_store.get_cached_simulation(_project_id, _input_hash)
+                if cached and cached.get("status") == "completed" and cached.get("result"):
+                    return jsonify({
+                        "success": True,
+                        "data": {
+                            "simulation_id": simulation_id,
+                            "task_id": cached.get("task_id") or f"cached:{cached['id']}",
+                            "cached": True,
+                            "result": cached["result"],
+                            "runner_status": "completed",
+                        }
+                    })
+            except Exception as e:
+                logger.warning(f"cache lookup failed: {e}")
+
+        if _project_id and _input_hash:
+            try:
+                supabase_store.upsert_simulation(
+                    _project_id, _input_hash,
+                    config=_cache_config, status="running",
+                    simulation_id=simulation_id,
+                )
+            except Exception as e:
+                logger.warning(f"cache upsert (running) failed: {e}")
+        # ---- end cache lookup ------------------------------------------
+
+        
         platform = data.get('platform', 'parallel')
         max_rounds = data.get('max_rounds')  # 可选：最大模拟轮数
         enable_graph_memory_update = data.get('enable_graph_memory_update', False)  # 可选：是否启用图谱记忆更新
@@ -1633,7 +1689,41 @@ def start_simulation():
             "success": False,
             "error": str(e)
         }), 400
-        
+
+        # ---- Persist final result to cache when runner completes -------
+        if _project_id and _input_hash:
+            import threading as _th
+            def _finalize():
+                try:
+                    _mgr = SimulationManager()
+                    while True:
+                        import time as _t; _t.sleep(5)
+                        s = _mgr.get_simulation(simulation_id)
+                        if not s: break
+                        st = s.to_dict().get("runner_status") or s.to_dict().get("status")
+                        if st in ("completed", "finished", "done"):
+                            supabase_store.upsert_simulation(
+                                _project_id, _input_hash,
+                                config=_cache_config, status="completed",
+                                simulation_id=simulation_id,
+                                result=s.to_dict(),
+                            )
+                            return
+                        if st in ("failed", "error", "stopped"):
+                            supabase_store.upsert_simulation(
+                                _project_id, _input_hash,
+                                config=_cache_config, status="failed",
+                                simulation_id=simulation_id,
+                                error=str(st),
+                            )
+                            return
+                except Exception as e:
+                    logger.warning(f"finalize thread failed: {e}")
+            _th.Thread(target=_finalize, name=f"sim-finalize-{simulation_id}", daemon=True).start()
+        # ----------------------------------------------------------------
+
+
+    
     except Exception as e:
         logger.error(f"启动模拟失败: {str(e)}")
         return jsonify({
