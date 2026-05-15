@@ -68,32 +68,35 @@ class Project:
         }
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> 'Project':
-        status = data.get('status', 'created')
-        if isinstance(status, str):
-            try:
-                status = ProjectStatus(status)
-            except ValueError:
-                status = ProjectStatus.CREATED
+def from_dict(cls, data: Dict[str, Any]) -> 'Project':
+    status = data.get('status', 'created')
+    if isinstance(status, str):
+        try:
+            status = ProjectStatus(status)
+        except ValueError:
+            status = ProjectStatus.CREATED
 
-        return cls(
-            project_id=data['project_id'],
-            name=data.get('name', 'Unnamed Project'),
-            status=status,
-            created_at=str(data.get('created_at') or ''),
-            updated_at=str(data.get('updated_at') or ''),
-            files=data.get('files') or [],
-            total_text_length=data.get('total_text_length', 0) or 0,
-            ontology=data.get('ontology'),
-            analysis_summary=data.get('analysis_summary'),
-            graph_id=data.get('graph_id'),
-            graph_build_task_id=data.get('graph_build_task_id'),
-            simulation_requirement=data.get('simulation_requirement'),
-            chunk_size=data.get('chunk_size', 500) or 500,
-            chunk_overlap=data.get('chunk_overlap', 50) or 50,
-            error=data.get('error'),
-        )
+    pid = data.get('project_id') or data.get('id')
+    if not pid:
+        raise ValueError(f"Project.from_dict: missing project_id in {list(data.keys())}")
 
+    return cls(
+        project_id=pid,
+        name=data.get('name', 'Unnamed Project'),
+        status=status,
+        created_at=str(data.get('created_at') or ''),
+        updated_at=str(data.get('updated_at') or ''),
+        files=data.get('files') or [],
+        total_text_length=data.get('total_text_length', 0) or 0,
+        ontology=data.get('ontology'),
+        analysis_summary=data.get('analysis_summary'),
+        graph_id=data.get('graph_id'),
+        graph_build_task_id=data.get('graph_build_task_id'),
+        simulation_requirement=data.get('simulation_requirement'),
+        chunk_size=data.get('chunk_size', 500) or 500,
+        chunk_overlap=data.get('chunk_overlap', 50) or 50,
+        error=data.get('error'),
+    )
 
 class ProjectManager:
     """Project manager — Supabase-backed, machine-agnostic."""
