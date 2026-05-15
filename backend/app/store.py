@@ -1,104 +1,139 @@
-# backend/app/store.py
+"""Supabase-backed store with in-memory fallback.
+
+Adds `_sanitize_for_postgres` to strip NUL (\\x00 / \\u0000) from any string
+before upserting — Postgres text/jsonb cannot store NUL and rejects with
+`22P05 unsupported Unicode escape sequence`.
+"""
+
+from __future__ import annotations
+
 import os
 import threading
+from collections import defaultdict
 from typing import Any, Dict, Optional
 
 _LOCK = threading.Lock()
-_MEM: Dict[str, Dict[str, Any]] = {
-    "projects": {},
-    "tasks": {},
-    "graphs": {},
-    "reports": {},
-}
-
+_MEM: Dict[str, Dict[str, Any]] = defaultdict(dict)
 _sb = None
 _sb_err: Optional[str] = None
 
 
+def _sanitize_for_postgres(value: Any):
+    if isinstance(value, str):
+        return value.replace("\x00", "")
+    if isinstance(value, dict):
+        return {k: _sanitize_for_postgres(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_sanitize_for_postgres(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_sanitize_for_postgres(v) for v in value)
+    return value
+
+
 def _client():
-    """Lazy Supabase client. Returns None if not configured or unreachable."""
     global _sb, _sb_err
     if _sb is not None or _sb_err is not None:
         return _sb
-    url = (os.environ.get("SUPABASE_URL") or "").strip().rstrip("/")
+    url = os.environ.get("SUPABASE_URL")
     key = (
         os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
         or os.environ.get("SUPABASE_KEY")
-        or ""
-    ).strip()
+    )
     if not url or not key:
-        _sb_err = "supabase env not set"
+        _sb_err = "SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY not set"
         return None
-    if not url.startswith("http"):
-        _sb_err = f"bad SUPABASE_URL: {url!r}"
-        return None
-    # strip accidental /rest/v1 suffix
-    for suffix in ("/rest/v1", "/rest"):
-        if url.endswith(suffix):
-            url = url[: -len(suffix)]
     try:
-        from supabase import create_client
+        from supabase import create_client  # type: ignore
         _sb = create_client(url, key)
-    except Exception as e:
-        _sb_err = f"create_client failed: {e}"
+    except Exception as e:  # pragma: no cover
+        _sb_err = f"supabase client init failed: {e}"
         _sb = None
     return _sb
 
 
 def _upsert(table: str, record: Dict[str, Any], mem_bucket: str, key: str):
+    record = _sanitize_for_postgres(record)
     with _LOCK:
         _MEM[mem_bucket][key] = record
     sb = _client()
-    if sb is None:
+    if not sb:
         return
     try:
         sb.table(table).upsert(record).execute()
     except Exception as e:
-        # Never crash the request because of persistence
-        print(f"[store] upsert {table} failed: {e}", flush=True)
+        # Surface to logs but don't break the pipeline (mem fallback wins)
+        try:
+            err = e.args[0] if e.args else str(e)
+        except Exception:
+            err = str(e)
+        print(f"[store] upsert {table} failed: {err}", flush=True)
 
 
 def _get(table: str, key_col: str, key: str, mem_bucket: str):
-    with _LOCK:
-        cached = _MEM[mem_bucket].get(key)
-    if cached is not None:
-        return cached
     sb = _client()
-    if sb is None:
-        return None
-    try:
-        res = sb.table(table).select("*").eq(key_col, key).limit(1).execute()
-        rows = res.data or []
-        if rows:
-            with _LOCK:
-                _MEM[mem_bucket][key] = rows[0]
-            return rows[0]
-    except Exception as e:
-        print(f"[store] get {table} failed: {e}", flush=True)
-    return None
+    if sb:
+        try:
+            res = sb.table(table).select("*").eq(key_col, key).limit(1).execute()
+            data = getattr(res, "data", None) or []
+            if data:
+                return data[0]
+        except Exception as e:
+            print(f"[store] select {table} failed: {e}", flush=True)
+    with _LOCK:
+        return _MEM[mem_bucket].get(key)
 
 
 def save_project(pid: str, payload: Dict[str, Any]):
-    _upsert("engine_projects", {"id": pid, **payload}, "projects", pid)
+    clean = _sanitize_for_postgres(payload)
+    _upsert(
+        "engine_projects",
+        {"id": pid, "project_id": pid, "data": clean, **clean},
+        "projects",
+        pid,
+    )
+
 
 def get_project(pid: str):
     return _get("engine_projects", "id", pid, "projects")
 
+
 def save_task(tid: str, payload: Dict[str, Any]):
-    _upsert("engine_tasks", {"id": tid, **payload}, "tasks", tid)
+    clean = _sanitize_for_postgres(payload)
+    _upsert(
+        "engine_tasks",
+        {"id": tid, "task_id": tid, "state": clean, **clean},
+        "tasks",
+        tid,
+    )
+
 
 def get_task(tid: str):
     return _get("engine_tasks", "id", tid, "tasks")
 
+
 def save_graph(gid: str, payload: Dict[str, Any]):
-    _upsert("engine_graphs", {"id": gid, **payload}, "graphs", gid)
+    clean = _sanitize_for_postgres(payload)
+    _upsert(
+        "engine_graphs",
+        {"id": gid, "graph_id": gid, "data": clean, **clean},
+        "graphs",
+        gid,
+    )
+
 
 def get_graph(gid: str):
     return _get("engine_graphs", "id", gid, "graphs")
 
+
 def save_report(rid: str, payload: Dict[str, Any]):
-    _upsert("engine_reports", {"id": rid, **payload}, "reports", rid)
+    clean = _sanitize_for_postgres(payload)
+    _upsert(
+        "engine_reports",
+        {"id": rid, "report_id": rid, "data": clean, **clean},
+        "reports",
+        rid,
+    )
+
 
 def get_report(rid: str):
     return _get("engine_reports", "id", rid, "reports")
-
