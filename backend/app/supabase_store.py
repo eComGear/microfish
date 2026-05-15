@@ -1,12 +1,15 @@
 # backend/app/supabase_store.py
 """
 Supabase persistence layer for MicroFish backend.
-Self-contained: does NOT import from app.models or any sibling that imports back.
+URL is normalised so SUPABASE_URL may include /rest/v1, trailing slash, or
+a Supabase dashboard URL — supabase-py always receives the bare project URL.
 """
 from __future__ import annotations
 
 import os
+import re
 import json
+import hashlib
 import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -16,20 +19,45 @@ from supabase import create_client, Client
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Config
+# URL / key normalisation (inline so this file is self-contained)
 # ---------------------------------------------------------------------------
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
-SUPABASE_KEY = (
-    os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
-    or os.environ.get("SUPABASE_KEY")
-    or os.environ.get("SUPABASE_ANON_KEY")
-    or ""
-)
+def _normalize_supabase_url(raw: Optional[str]) -> str:
+    if not raw:
+        return ""
+    url = raw.strip().rstrip("/")
+    # Strip user-supplied /rest/v1 or /rest/v1/<anything>
+    url = re.sub(r"/rest/v1(/.*)?$", "", url, flags=re.IGNORECASE)
+    # Convert dashboard URL to project URL
+    url = re.sub(
+        r"^https?://supabase\.com/dashboard/project/([^/]+).*$",
+        r"https://\1.supabase.co",
+        url,
+        flags=re.IGNORECASE,
+    )
+    return url.rstrip("/")
+
+
+def _read_url() -> str:
+    return _normalize_supabase_url(os.environ.get("SUPABASE_URL"))
+
+
+def _read_key() -> str:
+    return (
+        os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+        or os.environ.get("SUPABASE_KEY")
+        or os.environ.get("SUPABASE_ANON_KEY")
+        or ""
+    )
+
+
+SUPABASE_URL = _read_url()
+SUPABASE_KEY = _read_key()
 
 PROJECTS_TABLE = os.environ.get("SB_PROJECTS_TABLE", "engine_projects")
 EXTRACTED_TEXTS_TABLE = os.environ.get("SB_EXTRACTED_TEXTS_TABLE", "engine_extracted_texts")
 GRAPHS_TABLE = os.environ.get("SB_GRAPHS_TABLE", "engine_graphs")
 TASKS_TABLE = os.environ.get("SB_TASKS_TABLE", "engine_tasks")
+REPORTS_TABLE = os.environ.get("SB_REPORTS_TABLE", "engine_reports")
 
 _client: Optional[Client] = None
 
@@ -37,9 +65,12 @@ _client: Optional[Client] = None
 def client() -> Client:
     global _client
     if _client is None:
-        if not SUPABASE_URL or not SUPABASE_KEY:
-            raise RuntimeError("SUPABASE_URL / SUPABASE_KEY env not set")
-        _client = create_client(SUPABASE_URL, SUPABASE_KEY)
+        url = SUPABASE_URL or _read_url()
+        key = SUPABASE_KEY or _read_key()
+        if not url or not key:
+            raise RuntimeError("SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY env not set")
+        _client = create_client(url, key)
+        log.info("[supabase_store] client ready: %s", url)
     return _client
 
 
@@ -51,16 +82,12 @@ def _now() -> str:
 
 
 def _as_text(v: Any) -> str:
-    """Coerce any stored value to a plain string. Prevents '.strip on list' errors."""
     if v is None:
         return ""
     if isinstance(v, str):
         return v
     if isinstance(v, (list, tuple)):
-        parts = []
-        for item in v:
-            parts.append(_as_text(item))
-        return "\n\n".join(p for p in parts if p)
+        return "\n\n".join(p for p in (_as_text(x) for x in v) if p)
     if isinstance(v, dict):
         for k in ("content", "text", "extracted_text", "value"):
             if k in v:
@@ -73,7 +100,6 @@ def _as_text(v: Any) -> str:
 
 
 def _coerce_id(value: Any, name: str = "id") -> str:
-    """Accept str OR dict({'project_id': '...'}) — normalize to str."""
     if isinstance(value, str):
         return value
     if isinstance(value, dict):
@@ -105,26 +131,34 @@ def get_project(project_id: Any) -> Optional[Dict[str, Any]]:
     pid = _coerce_id(project_id, "project_id")
     res = client().table(PROJECTS_TABLE).select("data").eq("project_id", pid).limit(1).execute()
     rows = res.data or []
-    if not rows:
-        return None
-    return rows[0].get("data") or None
+    return rows[0].get("data") if rows else None
 
 
-def list_projects() -> List[Dict[str, Any]]:
+def list_projects(limit: int = 100) -> List[Dict[str, Any]]:
     res = (
         client()
         .table(PROJECTS_TABLE)
         .select("data")
         .order("updated_at", desc=True)
+        .limit(limit)
         .execute()
     )
     return [r["data"] for r in (res.data or []) if r.get("data")]
 
 
-def delete_project(project_id: Any) -> None:
+def upsert_project(project: Dict[str, Any]) -> Dict[str, Any]:
+    return save_project(project)
+
+
+def delete_project(project_id: Any) -> bool:
     pid = _coerce_id(project_id, "project_id")
-    client().table(PROJECTS_TABLE).delete().eq("project_id", pid).execute()
-    client().table(EXTRACTED_TEXTS_TABLE).delete().eq("project_id", pid).execute()
+    try:
+        client().table(PROJECTS_TABLE).delete().eq("project_id", pid).execute()
+        client().table(EXTRACTED_TEXTS_TABLE).delete().eq("project_id", pid).execute()
+        return True
+    except Exception as e:
+        log.warning("delete_project failed: %s", e)
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -137,11 +171,10 @@ def save_extracted_text(
     metadata: Optional[Dict[str, Any]] = None,
 ) -> None:
     pid = _coerce_id(project_id, "project_id")
-    text = _as_text(content)
     row = {
         "project_id": pid,
         "source_id": source_id or "default",
-        "content": text,
+        "content": _as_text(content),
         "metadata": metadata or {},
         "created_at": _now(),
     }
@@ -158,7 +191,6 @@ def save_extracted_text(
 
 
 def get_extracted_text(project_id: Any) -> str:
-    """Always returns a single concatenated string (never list/dict)."""
     pid = _coerce_id(project_id, "project_id")
     res = (
         client()
@@ -169,10 +201,7 @@ def get_extracted_text(project_id: Any) -> str:
         .execute()
     )
     rows = res.data or []
-    if not rows:
-        return ""
-    parts = [_as_text(r.get("content")) for r in rows]
-    return "\n\n".join(p for p in parts if p)
+    return "\n\n".join(p for p in (_as_text(r.get("content")) for r in rows) if p)
 
 
 # ---------------------------------------------------------------------------
@@ -181,22 +210,17 @@ def get_extracted_text(project_id: Any) -> str:
 def save_graph(graph_id: Any, project_id: Any, data: Dict[str, Any]) -> None:
     gid = _coerce_id(graph_id, "graph_id")
     pid = _coerce_id(project_id, "project_id")
-    row = {
-        "graph_id": gid,
-        "project_id": pid,
-        "data": data,
-        "updated_at": _now(),
-    }
-    client().table(GRAPHS_TABLE).upsert(row, on_conflict="graph_id").execute()
+    client().table(GRAPHS_TABLE).upsert(
+        {"graph_id": gid, "project_id": pid, "data": data, "updated_at": _now()},
+        on_conflict="graph_id",
+    ).execute()
 
 
 def get_graph(graph_id: Any) -> Optional[Dict[str, Any]]:
     gid = _coerce_id(graph_id, "graph_id")
     res = client().table(GRAPHS_TABLE).select("data").eq("graph_id", gid).limit(1).execute()
     rows = res.data or []
-    if not rows:
-        return None
-    return rows[0].get("data") or None
+    return rows[0].get("data") if rows else None
 
 
 # ---------------------------------------------------------------------------
@@ -204,13 +228,11 @@ def get_graph(graph_id: Any) -> Optional[Dict[str, Any]]:
 # ---------------------------------------------------------------------------
 def save_task(task_id: Any, state: Dict[str, Any]) -> None:
     tid = _coerce_id(task_id, "task_id")
-    row = {
-        "task_id": tid,
-        "state": state,
-        "updated_at": _now(),
-    }
     try:
-        client().table(TASKS_TABLE).upsert(row, on_conflict="task_id").execute()
+        client().table(TASKS_TABLE).upsert(
+            {"task_id": tid, "state": state, "updated_at": _now()},
+            on_conflict="task_id",
+        ).execute()
     except Exception as e:
         log.warning("save_task failed: %s", e)
 
@@ -220,43 +242,44 @@ def get_task(task_id: Any) -> Optional[Dict[str, Any]]:
     try:
         res = client().table(TASKS_TABLE).select("state").eq("task_id", tid).limit(1).execute()
         rows = res.data or []
-        if not rows:
-            return None
-        return rows[0].get("state") or None
+        return rows[0].get("state") if rows else None
     except Exception as e:
         log.warning("get_task failed: %s", e)
         return None
 
 
-__all__ = [
-    "client",
-    "save_project",
-    "get_project",
-    "list_projects",
-    "delete_project",
-    "save_extracted_text",
-    "get_extracted_text",
-    "save_graph",
-    "get_graph",
-    "save_task",
-    "get_task",
-]
-
-import hashlib, json
-
+# ---------------------------------------------------------------------------
+# Simulations
+# ---------------------------------------------------------------------------
 def compute_input_hash(payload: dict) -> str:
     canon = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(canon.encode("utf-8")).hexdigest()
 
+
 def get_cached_simulation(project_id: str, input_hash: str):
-    r = client().table("simulations").select("*") \
-        .eq("project_id", project_id).eq("input_hash", input_hash) \
-        .maybe_single().execute()
+    r = (
+        client()
+        .table("simulations")
+        .select("*")
+        .eq("project_id", project_id)
+        .eq("input_hash", input_hash)
+        .maybe_single()
+        .execute()
+    )
     return r.data if r and r.data else None
 
-def upsert_simulation(project_id: str, input_hash: str, *,
-                      config=None, result=None, status="pending", error=None,
-                      simulation_id=None, task_id=None):
+
+def upsert_simulation(
+    project_id: str,
+    input_hash: str,
+    *,
+    config=None,
+    result=None,
+    status="pending",
+    error=None,
+    simulation_id=None,
+    task_id=None,
+):
     row = {
         "project_id": project_id,
         "input_hash": input_hash,
@@ -268,23 +291,58 @@ def upsert_simulation(project_id: str, input_hash: str, *,
         "task_id": task_id,
         "updated_at": "now()",
     }
-    row = {k: v for k, v in row.items() if v is not None or k in ("config","result","error","status")}
-    return client().table("simulations").upsert(
-        row, on_conflict="project_id,input_hash"
-    ).execute()
+    row = {
+        k: v
+        for k, v in row.items()
+        if v is not None or k in ("config", "result", "error", "status")
+    }
+    return (
+        client()
+        .table("simulations")
+        .upsert(row, on_conflict="project_id,input_hash")
+        .execute()
+    )
+
 
 def list_simulations(project_id: str, limit: int = 50):
-    r = client().table("simulations").select("*") \
-        .eq("project_id", project_id) \
-        .order("created_at", desc=True).limit(limit).execute()
+    r = (
+        client()
+        .table("simulations")
+        .select("*")
+        .eq("project_id", project_id)
+        .order("created_at", desc=True)
+        .limit(limit)
+        .execute()
+    )
     return r.data or []
 
 
-# ---------------------------------------------------------------------------
-# Reports (mirror of in-memory ReportManager into Supabase)
-# ---------------------------------------------------------------------------
-REPORTS_TABLE = os.environ.get("SB_REPORTS_TABLE", "engine_reports")
+def upsert_simulation_meta(
+    simulation_id: str,
+    project_id: str,
+    *,
+    graph_id=None,
+    enable_twitter=True,
+    enable_reddit=False,
+) -> None:
+    try:
+        client().table("simulations_meta").upsert(
+            {
+                "simulation_id": simulation_id,
+                "project_id": project_id,
+                "graph_id": graph_id,
+                "enable_twitter": enable_twitter,
+                "enable_reddit": enable_reddit,
+            },
+            on_conflict="simulation_id",
+        ).execute()
+    except Exception as e:
+        log.warning("upsert_simulation_meta failed: %s", e)
 
+
+# ---------------------------------------------------------------------------
+# Reports
+# ---------------------------------------------------------------------------
 def save_report(report: Dict[str, Any]) -> None:
     rid = report.get("report_id") or report.get("id")
     if not rid:
@@ -305,21 +363,34 @@ def save_report(report: Dict[str, Any]) -> None:
     except Exception as e:
         log.warning("save_report failed: %s", e)
 
+
 def get_report(report_id: str) -> Optional[Dict[str, Any]]:
     try:
         r = client().table(REPORTS_TABLE).select("data").eq("report_id", report_id).limit(1).execute()
         rows = r.data or []
         return rows[0].get("data") if rows else None
     except Exception as e:
-        log.warning("get_report failed: %s", e); return None
+        log.warning("get_report failed: %s", e)
+        return None
+
 
 def get_report_by_simulation(simulation_id: str) -> Optional[Dict[str, Any]]:
     try:
-        r = client().table(REPORTS_TABLE).select("data")             .eq("simulation_id", simulation_id)             .order("updated_at", desc=True).limit(1).execute()
+        r = (
+            client()
+            .table(REPORTS_TABLE)
+            .select("data")
+            .eq("simulation_id", simulation_id)
+            .order("updated_at", desc=True)
+            .limit(1)
+            .execute()
+        )
         rows = r.data or []
         return rows[0].get("data") if rows else None
     except Exception as e:
-        log.warning("get_report_by_simulation failed: %s", e); return None
+        log.warning("get_report_by_simulation failed: %s", e)
+        return None
+
 
 def list_reports(simulation_id: Optional[str] = None, limit: int = 100) -> List[Dict[str, Any]]:
     try:
@@ -329,19 +400,19 @@ def list_reports(simulation_id: Optional[str] = None, limit: int = 100) -> List[
         r = q.order("updated_at", desc=True).limit(limit).execute()
         return [row["data"] for row in (r.data or []) if row.get("data")]
     except Exception as e:
-        log.warning("list_reports failed: %s", e); return []
+        log.warning("list_reports failed: %s", e)
+        return []
 
-# simulations_meta helper used by /start
-def upsert_simulation_meta(simulation_id: str, project_id: str, *,
-                           graph_id=None, enable_twitter=True, enable_reddit=False) -> None:
-    row = {
-        "simulation_id": simulation_id,
-        "project_id": project_id,
-        "graph_id": graph_id,
-        "enable_twitter": enable_twitter,
-        "enable_reddit": enable_reddit,
-    }
-    try:
-        client().table("simulations_meta").upsert(row, on_conflict="simulation_id").execute()
-    except Exception as e:
-        log.warning("upsert_simulation_meta failed: %s", e)
+
+__all__ = [
+    "client",
+    "save_project", "get_project", "list_projects", "upsert_project", "delete_project",
+    "save_extracted_text", "get_extracted_text",
+    "save_graph", "get_graph",
+    "save_task", "get_task",
+    "compute_input_hash", "get_cached_simulation", "upsert_simulation",
+    "list_simulations", "upsert_simulation_meta",
+    "save_report", "get_report", "get_report_by_simulation", "list_reports",
+]
+
+
