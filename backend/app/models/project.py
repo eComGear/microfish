@@ -126,13 +126,7 @@ class ProjectManager:
         project_id = f"proj_{uuid.uuid4().hex[:12]}"
         now = datetime.now().isoformat()
 
-        project = Project(
-            project_id=project_id,
-            name=name,
-            status=ProjectStatus.CREATED,
-            created_at=now,
-            updated_at=now,
-        )
+    def get_project(project_id: Any) -> Optional[Dict[str, Any]]:
 
         os.makedirs(cls._get_project_files_dir(project_id), exist_ok=True)
 
