@@ -1,40 +1,44 @@
-# fly.toml — MicroFish single-app deployment
-app = 'microfish'
-primary_region = 'nrt'
-kill_signal  = 'SIGTERM'
-kill_timeout = '120s'   # give running simulations time to flush to Supabase
+app = "microfish"
+primary_region = "hkg"
 
 [build]
-  dockerfile = 'Dockerfile'
 
 [env]
-  PORT = '8080'
-  REPORT_DATA_DIR     = '/data/reports'
-  SIMULATION_DATA_DIR = '/data/simulations'
-  UPLOADS_DIR         = '/data/uploads'
-  PYTHONUNBUFFERED    = '1'
+  PORT = "8080"
+  PYTHONUNBUFFERED = "1"
+
+[processes]
+  app = "gunicorn -w 1 -k gthread --threads 16 -t 600 --graceful-timeout 120 -b 0.0.0.0:8080 run:app"
 
 [[mounts]]
-  source      = 'microfish_data'
-  destination = '/data'
+  source = "microfish_data"
+  destination = "/data"
 
-[http_service]
-  internal_port       = 8080
-  force_https         = true
-  auto_stop_machines  = 'off'   # keep warm — sims run in background threads
+[[services]]
+  protocol = "tcp"
+  internal_port = 8080
+  auto_stop_machines = "off"
   auto_start_machines = true
   min_machines_running = 1
-  processes           = ['app']
 
-  [[http_service.checks]]
-    interval      = '30s'
-    timeout       = '5s'
-    grace_period  = '30s'
-    method        = 'GET'
-    path          = '/health'
+  [[services.ports]]
+    port = 80
+    handlers = ["http"]
+    force_https = true
+
+  [[services.ports]]
+    port = 443
+    handlers = ["tls", "http"]
+
+  [[services.http_checks]]
+    interval = "15s"
+    timeout = "5s"
+    grace_period = "30s"
+    method = "GET"
+    path = "/health"
 
 [[vm]]
-  cpu_kind  = 'shared'
-  cpus      = 2          # was 1 — sims are CPU bound
-  memory_mb = 2048       # was 1024 — LLM + graph build needs headroom
+  cpu_kind = "shared"
+  cpus = 2
+  memory_mb = 2048
 
