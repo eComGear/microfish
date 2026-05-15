@@ -127,7 +127,7 @@ def save_project(project: Dict[str, Any]) -> Dict[str, Any]:
     return project
 
 
-ef get_project(project_id: Any) -> Optional[Dict[str, Any]]:
+def get_project(project_id: Any) -> Optional[Dict[str, Any]]:
     pid = _coerce_id(project_id, "project_id")
     res = (
         client()
