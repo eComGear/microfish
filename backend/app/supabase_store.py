@@ -249,13 +249,14 @@ def compute_input_hash(payload: dict) -> str:
     return hashlib.sha256(canon.encode("utf-8")).hexdigest()
 
 def get_cached_simulation(project_id: str, input_hash: str):
-    r = _client().table("simulations").select("*") \
+    r = client().table("simulations").select("*") \
         .eq("project_id", project_id).eq("input_hash", input_hash) \
         .maybe_single().execute()
     return r.data if r and r.data else None
 
 def upsert_simulation(project_id: str, input_hash: str, *,
-                      config=None, result=None, status="pending", error=None):
+                      config=None, result=None, status="pending", error=None,
+                      simulation_id=None, task_id=None):
     row = {
         "project_id": project_id,
         "input_hash": input_hash,
@@ -263,14 +264,84 @@ def upsert_simulation(project_id: str, input_hash: str, *,
         "result": result,
         "status": status,
         "error": error,
+        "simulation_id": simulation_id,
+        "task_id": task_id,
         "updated_at": "now()",
     }
-    return _client().table("simulations").upsert(
+    row = {k: v for k, v in row.items() if v is not None or k in ("config","result","error","status")}
+    return client().table("simulations").upsert(
         row, on_conflict="project_id,input_hash"
     ).execute()
 
 def list_simulations(project_id: str, limit: int = 50):
-    r = _client().table("simulations").select("*") \
+    r = client().table("simulations").select("*") \
         .eq("project_id", project_id) \
         .order("created_at", desc=True).limit(limit).execute()
     return r.data or []
+
+
+# ---------------------------------------------------------------------------
+# Reports (mirror of in-memory ReportManager into Supabase)
+# ---------------------------------------------------------------------------
+REPORTS_TABLE = os.environ.get("SB_REPORTS_TABLE", "engine_reports")
+
+def save_report(report: Dict[str, Any]) -> None:
+    rid = report.get("report_id") or report.get("id")
+    if not rid:
+        return
+    row = {
+        "report_id": rid,
+        "simulation_id": report.get("simulation_id"),
+        "project_id": report.get("project_id"),
+        "status": str(report.get("status", "pending")).lower().split(".")[-1],
+        "title": report.get("title"),
+        "markdown_content": report.get("markdown_content") or report.get("markdown"),
+        "outline": report.get("outline"),
+        "data": report,
+        "updated_at": _now(),
+    }
+    try:
+        client().table(REPORTS_TABLE).upsert(row, on_conflict="report_id").execute()
+    except Exception as e:
+        log.warning("save_report failed: %s", e)
+
+def get_report(report_id: str) -> Optional[Dict[str, Any]]:
+    try:
+        r = client().table(REPORTS_TABLE).select("data").eq("report_id", report_id).limit(1).execute()
+        rows = r.data or []
+        return rows[0].get("data") if rows else None
+    except Exception as e:
+        log.warning("get_report failed: %s", e); return None
+
+def get_report_by_simulation(simulation_id: str) -> Optional[Dict[str, Any]]:
+    try:
+        r = client().table(REPORTS_TABLE).select("data")             .eq("simulation_id", simulation_id)             .order("updated_at", desc=True).limit(1).execute()
+        rows = r.data or []
+        return rows[0].get("data") if rows else None
+    except Exception as e:
+        log.warning("get_report_by_simulation failed: %s", e); return None
+
+def list_reports(simulation_id: Optional[str] = None, limit: int = 100) -> List[Dict[str, Any]]:
+    try:
+        q = client().table(REPORTS_TABLE).select("data")
+        if simulation_id:
+            q = q.eq("simulation_id", simulation_id)
+        r = q.order("updated_at", desc=True).limit(limit).execute()
+        return [row["data"] for row in (r.data or []) if row.get("data")]
+    except Exception as e:
+        log.warning("list_reports failed: %s", e); return []
+
+# simulations_meta helper used by /start
+def upsert_simulation_meta(simulation_id: str, project_id: str, *,
+                           graph_id=None, enable_twitter=True, enable_reddit=False) -> None:
+    row = {
+        "simulation_id": simulation_id,
+        "project_id": project_id,
+        "graph_id": graph_id,
+        "enable_twitter": enable_twitter,
+        "enable_reddit": enable_reddit,
+    }
+    try:
+        client().table("simulations_meta").upsert(row, on_conflict="simulation_id").execute()
+    except Exception as e:
+        log.warning("upsert_simulation_meta failed: %s", e)
