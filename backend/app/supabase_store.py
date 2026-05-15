@@ -127,23 +127,49 @@ def save_project(project: Dict[str, Any]) -> Dict[str, Any]:
     return project
 
 
-def get_project(project_id: Any) -> Optional[Dict[str, Any]]:
+ef get_project(project_id: Any) -> Optional[Dict[str, Any]]:
     pid = _coerce_id(project_id, "project_id")
-    res = client().table(PROJECTS_TABLE).select("data").eq("project_id", pid).limit(1).execute()
+    res = (
+        client()
+        .table(PROJECTS_TABLE)
+        .select("project_id,name,status,data,created_at,updated_at")
+        .eq("project_id", pid)
+        .limit(1)
+        .execute()
+    )
     rows = res.data or []
-    return rows[0].get("data") if rows else None
+    if not rows:
+        return None
+    row = rows[0]
+    data = dict(row.get("data") or {})
+    # guarantee the id round-trips even if older rows stored data without it
+    data.setdefault("project_id", row.get("project_id") or pid)
+    data.setdefault("name", row.get("name"))
+    data.setdefault("status", row.get("status", "created"))
+    data.setdefault("created_at", row.get("created_at"))
+    data.setdefault("updated_at", row.get("updated_at"))
+    return data
 
 
 def list_projects(limit: int = 100) -> List[Dict[str, Any]]:
     res = (
         client()
         .table(PROJECTS_TABLE)
-        .select("data")
+        .select("project_id,name,status,data,created_at,updated_at")
         .order("updated_at", desc=True)
         .limit(limit)
         .execute()
     )
-    return [r["data"] for r in (res.data or []) if r.get("data")]
+    out: List[Dict[str, Any]] = []
+    for row in res.data or []:
+        data = dict(row.get("data") or {})
+        data.setdefault("project_id", row.get("project_id"))
+        data.setdefault("name", row.get("name"))
+        data.setdefault("status", row.get("status", "created"))
+        data.setdefault("created_at", row.get("created_at"))
+        data.setdefault("updated_at", row.get("updated_at"))
+        out.append(data)
+    return out
 
 
 def upsert_project(project: Dict[str, Any]) -> Dict[str, Any]:
