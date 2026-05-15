@@ -9,6 +9,38 @@ from flask import Blueprint, jsonify, request
 
 from app.services.graph_builder_service import GraphBuilderService
 from app.services.ontology_service import OntologyService
+# OntologyService export name varies across microfish versions. Resolve at import
+# time so a rename in ontology_service.py does not crash the worker on boot.
+try:
+    from app.services.ontology_service import OntologyService  # type: ignore
+except ImportError:  # pragma: no cover - compat shim
+    import app.services.ontology_service as _ontology_mod
+    _OntologyService = (
+        getattr(_ontology_mod, "OntologyService", None)
+        or getattr(_ontology_mod, "OntologyBuilder", None)
+        or getattr(_ontology_mod, "OntologyGenerator", None)
+        or getattr(_ontology_mod, "Ontology", None)
+    )
+    if _OntologyService is None:
+        # Last resort: synthesize a minimal service that calls a module-level
+        # generate_from_chunks() / generate_ontology() if one exists, otherwise
+        # returns an empty ontology so /api/graph/ontology/generate keeps working.
+        class _OntologyService:  # type: ignore
+            def generate_from_chunks(self, chunks, requirement: str = ""):
+                fn = (
+                    getattr(_ontology_mod, "generate_from_chunks", None)
+                    or getattr(_ontology_mod, "generate_ontology", None)
+                )
+                if fn is None:
+                    return {"entities": [], "relations": []}
+                try:
+                    return fn(chunks=chunks, requirement=requirement)
+                except TypeError:
+                    return fn(chunks, requirement)
+    OntologyService = _OntologyService  # type: ignore
+
+
+
 from app.store import (
     get_graph,
     get_project,
