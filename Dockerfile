@@ -7,18 +7,21 @@ RUN apt-get update \
   && rm -rf /var/lib/apt/lists/*
 
 COPY backend/requirements.txt ./backend/requirements.txt
-RUN pip install --no-cache-dir -r backend/requirements.txt
+RUN pip install --no-cache-dir -r backend/requirements.txt \
+ && pip install --no-cache-dir gunicorn
 
 COPY backend ./backend
 
 WORKDIR /app/backend
 
-ENV HOST=0.0.0.0
-ENV PORT=8080
-ENV FLASK_PORT=8080
-ENV PYTHONUNBUFFERED=1
+ENV HOST=0.0.0.0 \
+    PORT=8080 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
 
 EXPOSE 8080
 
-CMD ["python", "run.py"]
-
+# Production WSGI server. 2 workers x 8 threads, 5-min timeout for long sims.
+CMD ["gunicorn", "-w", "2", "-k", "gthread", "--threads", "8", \
+     "-t", "300", "--graceful-timeout", "120", \
+     "-b", "0.0.0.0:8080", "run:app"]
