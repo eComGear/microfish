@@ -9,14 +9,24 @@ Fixes shipped in this version:
 
 2. `prepare_simulation()` no longer leaks a Zep `ApiError: 404 not found`
    traceback to the frontend. If the bound `graph_id` is missing in Zep
-   we return HTTP 400 with `api.graphNotBuilt`.
+   (e.g. because the project was created before the graph_id bugfix), we
+   return HTTP 400 with `api.graphNotBuilt` so the UI can prompt the user
+   to rebuild the graph instead of showing a 500.
 
-3. `upsert_simulation()` is called with keyword args only and tolerates a
-   missing `input_hash` (auto-computed).
+3. `upsert_simulation()` is now called with keyword args only; combined with
+   the supabase_store hotfix it tolerates a missing `input_hash`
+   (auto-computed) instead of raising
+   `upsert_simulation() missing 1 required positional argument: 'input_hash'`.
 
-4. Tolerant import for SimulationService — upstream module name varies
-   (`simulation_service`, `simulation`, `simulator`, `simulation_runner`).
-   No more `ModuleNotFoundError: No module named 'app.services.simulation_service'`.
+4. Tolerant `app.store` import: older deployments don't expose
+   `get_simulation` / `save_simulation`, so we fall back to `get_task` /
+   `save_task` instead of crashing the worker at boot with
+   `ImportError: cannot import name 'get_simulation' from 'app.store'`.
+
+5. Tolerant `SimulationService` import: tries multiple known module paths
+   (`simulation_service`, `simulation`, `simulator`, `simulation_runner`)
+   and falls back to a stub that raises a clear runtime error so the
+   blueprint can still register at boot.
 """
 
 from __future__ import annotations
@@ -30,9 +40,9 @@ from typing import Any, Dict, Optional
 
 from flask import Blueprint, jsonify, request
 
-# ---- Tolerant import: try every known upstream name, then fall back to a
-# stub so the blueprint can still register and the error is reported at
-# request time instead of crashing the worker at boot. ----------------------
+# ---------------------------------------------------------------------------
+# Tolerant SimulationService import
+# ---------------------------------------------------------------------------
 SimulationService = None  # type: ignore
 _sim_import_error: Optional[str] = None
 for _mod, _cls in (
@@ -56,20 +66,30 @@ if SimulationService is None:  # pragma: no cover
             pass
         def run(self, **kwargs):
             raise RuntimeError(
-                "SimulationService not available: " + (_sim_import_error or "unknown")
+                "SimulationService is not available: " + (_sim_import_error or "unknown")
             )
+
 # ---------------------------------------------------------------------------
+# Tolerant app.store imports
+# ---------------------------------------------------------------------------
+from app.store import get_graph, get_project, get_task, save_task  # type: ignore
 
-from app.store import (
-    get_graph,
-    get_project,
-    get_simulation,
-    get_task,
-    save_simulation,
-    save_task,
-)
+try:
+    from app.store import get_simulation  # type: ignore
+except Exception:  # pragma: no cover
+    def get_simulation(sid: str):  # type: ignore
+        return get_task(sid)
 
-# Optional Supabase mirror (best-effort, must never break the request).
+try:
+    from app.store import save_simulation  # type: ignore
+except Exception:  # pragma: no cover
+    def save_simulation(sid: str, payload: Dict[str, Any]):  # type: ignore
+        # Mirror into engine_tasks bucket so /api/simulation/<id> can still read it.
+        save_task(sid, {"task_id": sid, **(payload or {})})
+
+# ---------------------------------------------------------------------------
+# Optional Supabase mirror (best-effort, must never break the request)
+# ---------------------------------------------------------------------------
 try:
     from app.store.supabase_store import (
         upsert_simulation as sb_upsert_simulation,
@@ -79,7 +99,9 @@ except Exception:  # pragma: no cover
     sb_upsert_simulation = None
     sb_get_cached_simulation = None
 
-# Zep error type for the 404 guard.
+# ---------------------------------------------------------------------------
+# Zep client + error type
+# ---------------------------------------------------------------------------
 try:
     from zep_cloud.core.api_error import ApiError as ZepApiError
 except Exception:  # pragma: no cover
@@ -89,7 +111,7 @@ except Exception:  # pragma: no cover
 try:
     from app.services.zep_client import zep_client  # type: ignore
 except Exception:  # pragma: no cover
-    zep_client = None
+    zep_client = None  # entity reader path will degrade gracefully
 
 log = logging.getLogger(__name__)
 
@@ -106,6 +128,7 @@ def _compute_input_hash(payload: Dict[str, Any]) -> str:
 
 
 def _safe_sb_upsert(row: Dict[str, Any]) -> None:
+    """Mirror to Supabase. Never raise."""
     if not sb_upsert_simulation:
         return
     try:
@@ -120,8 +143,9 @@ def _safe_sb_upsert(row: Dict[str, Any]) -> None:
 
 
 def _zep_graph_exists(graph_id: str) -> bool:
+    """Return True iff Zep can resolve `graph_id`. False on 404. Re-raises other errors."""
     if not zep_client:
-        return True
+        return True  # cannot verify; assume ok
     try:
         zep_client.graph.get(graph_id=graph_id)
         return True
@@ -140,7 +164,7 @@ def health():
 
 
 # ---------------------------------------------------------------------------
-# Entities
+# Entities (used by the frontend's waitForGraphReady poll)
 # ---------------------------------------------------------------------------
 @bp.route("/entities/<graph_id>", methods=["GET"])
 def entities(graph_id: str):
@@ -279,7 +303,7 @@ def start_simulation():
         if not proj:
             return jsonify({"error": f"project {project_id} not found"}), 404
 
-        # Read all inputs BEFORE the cache block that references them.
+        # Read all inputs BEFORE the cache block.
         platform = data.get("platform") or "default"
         max_rounds = int(data.get("max_rounds") or 1)
         force = bool(data.get("force") or False)
