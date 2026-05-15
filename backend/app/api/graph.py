@@ -1,3 +1,13 @@
+"""backend/app/api/graph.py
+
+Fixes the Zep 404 / api.graphNotBuilt bug:
+  - DO NOT replace the Zep graph_id with uuid.uuid4().
+  - Persist the real Zep graph_id returned by GraphBuilderService.build_from_chunks().
+  - Save it on both the graph row and the project row so /api/simulation/* can find it.
+"""
+
+from __future__ import annotations
+
 import logging
 import os
 import tempfile
@@ -8,39 +18,7 @@ from typing import Any, Dict, List, Optional
 from flask import Blueprint, jsonify, request
 
 from app.services.graph_builder_service import GraphBuilderService
-from app.services.ontology_service import OntologyService
-# OntologyService export name varies across microfish versions. Resolve at import
-# time so a rename in ontology_service.py does not crash the worker on boot.
-try:
-    from app.services.ontology_service import OntologyService  # type: ignore
-except ImportError:  # pragma: no cover - compat shim
-    import app.services.ontology_service as _ontology_mod
-    _OntologyService = (
-        getattr(_ontology_mod, "OntologyService", None)
-        or getattr(_ontology_mod, "OntologyBuilder", None)
-        or getattr(_ontology_mod, "OntologyGenerator", None)
-        or getattr(_ontology_mod, "Ontology", None)
-    )
-    if _OntologyService is None:
-        # Last resort: synthesize a minimal service that calls a module-level
-        # generate_from_chunks() / generate_ontology() if one exists, otherwise
-        # returns an empty ontology so /api/graph/ontology/generate keeps working.
-        class _OntologyService:  # type: ignore
-            def generate_from_chunks(self, chunks, requirement: str = ""):
-                fn = (
-                    getattr(_ontology_mod, "generate_from_chunks", None)
-                    or getattr(_ontology_mod, "generate_ontology", None)
-                )
-                if fn is None:
-                    return {"entities": [], "relations": []}
-                try:
-                    return fn(chunks=chunks, requirement=requirement)
-                except TypeError:
-                    return fn(chunks, requirement)
-    OntologyService = _OntologyService  # type: ignore
-
-
-
+from app.services.ontology_generator import OntologyGenerator
 from app.store import (
     get_graph,
     get_project,
@@ -53,6 +31,24 @@ from app.store import (
 log = logging.getLogger(__name__)
 
 bp = Blueprint("graph", __name__, url_prefix="/api/graph")
+
+
+# ontology_service.py in microfish exposes OntologyGenerator (and a module-level
+# generate_ontology helper) — there is no class named OntologyService. Wrap
+# OntologyGenerator so the route code can keep calling
+# .generate_from_chunks(chunks=..., requirement=...).
+class OntologyService:
+    """Thin adapter around OntologyGenerator for /ontology/generate."""
+
+    def __init__(self) -> None:
+        self._gen = OntologyGenerator()
+
+    def generate_from_chunks(self, chunks, requirement: str = ""):
+        return self._gen.generate(
+            document_texts=list(chunks or []),
+            simulation_requirement=requirement
+            or "Generate ontology for social simulation",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -244,4 +240,3 @@ def graph_get(graph_id: str):
     if not g:
         return jsonify({"error": "graph not found"}), 404
     return jsonify(g)
-
