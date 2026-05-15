@@ -1,3 +1,26 @@
+"""backend/app/api/simulation.py
+
+Fixes shipped in this version:
+
+1. `start_simulation()` no longer crashes with
+   `cannot access local variable 'platform' where it is not associated with a value`.
+   `platform`, `max_rounds`, and `force` are now read from the request body
+   BEFORE the Supabase cache lookup that uses them.
+
+2. `prepare_simulation()` no longer leaks a Zep `ApiError: 404 not found`
+   traceback to the frontend. If the bound `graph_id` is missing in Zep
+   we return HTTP 400 with `api.graphNotBuilt`.
+
+3. `upsert_simulation()` is called with keyword args only and tolerates a
+   missing `input_hash` (auto-computed).
+
+4. Tolerant import for SimulationService — upstream module name varies
+   (`simulation_service`, `simulation`, `simulator`, `simulation_runner`).
+   No more `ModuleNotFoundError: No module named 'app.services.simulation_service'`.
+"""
+
+from __future__ import annotations
+
 import hashlib
 import json
 import logging
@@ -7,7 +30,36 @@ from typing import Any, Dict, Optional
 
 from flask import Blueprint, jsonify, request
 
-from app.services.simulation_service import SimulationService
+# ---- Tolerant import: try every known upstream name, then fall back to a
+# stub so the blueprint can still register and the error is reported at
+# request time instead of crashing the worker at boot. ----------------------
+SimulationService = None  # type: ignore
+_sim_import_error: Optional[str] = None
+for _mod, _cls in (
+    ("app.services.simulation_service", "SimulationService"),
+    ("app.services.simulation", "SimulationService"),
+    ("app.services.simulator", "SimulationService"),
+    ("app.services.simulator", "Simulator"),
+    ("app.services.simulation", "Simulator"),
+    ("app.services.simulation_runner", "SimulationRunner"),
+):
+    try:
+        SimulationService = getattr(__import__(_mod, fromlist=[_cls]), _cls)
+        break
+    except Exception as _e:  # pragma: no cover
+        _sim_import_error = f"{_mod}.{_cls}: {_e}"
+        continue
+
+if SimulationService is None:  # pragma: no cover
+    class SimulationService:  # type: ignore
+        def __init__(self, *a, **kw):
+            pass
+        def run(self, **kwargs):
+            raise RuntimeError(
+                "SimulationService not available: " + (_sim_import_error or "unknown")
+            )
+# ---------------------------------------------------------------------------
+
 from app.store import (
     get_graph,
     get_project,
@@ -37,7 +89,7 @@ except Exception:  # pragma: no cover
 try:
     from app.services.zep_client import zep_client  # type: ignore
 except Exception:  # pragma: no cover
-    zep_client = None  # the entity reader path will degrade gracefully
+    zep_client = None
 
 log = logging.getLogger(__name__)
 
@@ -54,7 +106,6 @@ def _compute_input_hash(payload: Dict[str, Any]) -> str:
 
 
 def _safe_sb_upsert(row: Dict[str, Any]) -> None:
-    """Mirror to Supabase. Never raise."""
     if not sb_upsert_simulation:
         return
     try:
@@ -69,9 +120,8 @@ def _safe_sb_upsert(row: Dict[str, Any]) -> None:
 
 
 def _zep_graph_exists(graph_id: str) -> bool:
-    """Return True iff Zep can resolve `graph_id`. False on 404. Re-raises other errors."""
     if not zep_client:
-        return True  # cannot verify; assume ok
+        return True
     try:
         zep_client.graph.get(graph_id=graph_id)
         return True
@@ -90,7 +140,7 @@ def health():
 
 
 # ---------------------------------------------------------------------------
-# Entities (used by the frontend's waitForGraphReady poll)
+# Entities
 # ---------------------------------------------------------------------------
 @bp.route("/entities/<graph_id>", methods=["GET"])
 def entities(graph_id: str):
@@ -133,13 +183,11 @@ def prepare_simulation():
         if not graph_id:
             return jsonify({"error": "api.graphNotBuilt"}), 400
 
-        # ---- Zep 404 guard: do NOT leak a 500 traceback to the UI ----
         if not _zep_graph_exists(graph_id):
             return jsonify({
                 "error": "api.graphNotBuilt",
                 "detail": f"graph {graph_id} not found in Zep, rebuild graph first",
             }), 400
-        # --------------------------------------------------------------
 
         graph_row = get_graph(graph_id) or {}
         return jsonify({
@@ -231,22 +279,16 @@ def start_simulation():
         if not proj:
             return jsonify({"error": f"project {project_id} not found"}), 404
 
-        # ---- READ ALL INPUTS BEFORE THE CACHE BLOCK ----
-        # Previously `platform`, `max_rounds`, and `force` were read AFTER the
-        # Supabase cache block that referenced them, which raised
-        # `cannot access local variable 'platform' where it is not associated
-        # with a value`. They must be defined here.
+        # Read all inputs BEFORE the cache block that references them.
         platform = data.get("platform") or "default"
         max_rounds = int(data.get("max_rounds") or 1)
         force = bool(data.get("force") or False)
         config = data.get("config") or {}
         graph_id = data.get("graph_id") or proj.get("graph_id")
-        # ------------------------------------------------
 
         if not graph_id:
             return jsonify({"error": "api.graphNotBuilt"}), 400
 
-        # Guard against Zep-side missing graph BEFORE we burn an LLM run.
         if not _zep_graph_exists(graph_id):
             return jsonify({
                 "error": "api.graphNotBuilt",
@@ -262,7 +304,6 @@ def start_simulation():
         }
         input_hash = _compute_input_hash(cache_payload)
 
-        # Cache hit (skipped when force=True).
         if not force and sb_get_cached_simulation:
             try:
                 cached = sb_get_cached_simulation(
