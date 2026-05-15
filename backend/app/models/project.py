@@ -68,35 +68,36 @@ class Project:
         }
 
     @classmethod
-def from_dict(cls, data: Dict[str, Any]) -> 'Project':
-    status = data.get('status', 'created')
-    if isinstance(status, str):
-        try:
-            status = ProjectStatus(status)
-        except ValueError:
-            status = ProjectStatus.CREATED
+    def from_dict(cls, data: Dict[str, Any]) -> 'Project':
+        status = data.get('status', 'created')
+        if isinstance(status, str):
+            try:
+                status = ProjectStatus(status)
+            except ValueError:
+                status = ProjectStatus.CREATED
 
-    pid = data.get('project_id') or data.get('id')
-    if not pid:
-        raise ValueError(f"Project.from_dict: missing project_id in {list(data.keys())}")
+        pid = data.get('project_id') or data.get('id')
+        if not pid:
+            raise ValueError(f"Project.from_dict: missing project_id in {list(data.keys())}")
 
-    return cls(
-        project_id=pid,
-        name=data.get('name', 'Unnamed Project'),
-        status=status,
-        created_at=str(data.get('created_at') or ''),
-        updated_at=str(data.get('updated_at') or ''),
-        files=data.get('files') or [],
-        total_text_length=data.get('total_text_length', 0) or 0,
-        ontology=data.get('ontology'),
-        analysis_summary=data.get('analysis_summary'),
-        graph_id=data.get('graph_id'),
-        graph_build_task_id=data.get('graph_build_task_id'),
-        simulation_requirement=data.get('simulation_requirement'),
-        chunk_size=data.get('chunk_size', 500) or 500,
-        chunk_overlap=data.get('chunk_overlap', 50) or 50,
-        error=data.get('error'),
-    )
+        return cls(
+            project_id=pid,
+            name=data.get('name', 'Unnamed Project'),
+            status=status,
+            created_at=str(data.get('created_at') or ''),
+            updated_at=str(data.get('updated_at') or ''),
+            files=data.get('files') or [],
+            total_text_length=data.get('total_text_length', 0) or 0,
+            ontology=data.get('ontology'),
+            analysis_summary=data.get('analysis_summary'),
+            graph_id=data.get('graph_id'),
+            graph_build_task_id=data.get('graph_build_task_id'),
+            simulation_requirement=data.get('simulation_requirement'),
+            chunk_size=data.get('chunk_size', 500) or 500,
+            chunk_overlap=data.get('chunk_overlap', 50) or 50,
+            error=data.get('error'),
+        )
+
 
 class ProjectManager:
     """Project manager — Supabase-backed, machine-agnostic."""
@@ -133,7 +134,6 @@ class ProjectManager:
             updated_at=now,
         )
 
-        # local dirs for raw uploads on this machine
         os.makedirs(cls._get_project_files_dir(project_id), exist_ok=True)
 
         cls.save_project(project)
@@ -159,12 +159,11 @@ class ProjectManager:
     @classmethod
     def delete_project(cls, project_id: str) -> bool:
         ok = supabase_store.delete_project(project_id)
-        # best-effort local cleanup
         project_dir = cls._get_project_dir(project_id)
         if os.path.exists(project_dir):
             try:
                 shutil.rmtree(project_dir)
-            except Exception:  # noqa: BLE001
+            except Exception:
                 pass
         return ok
 
@@ -172,8 +171,6 @@ class ProjectManager:
 
     @classmethod
     def save_file_to_project(cls, project_id: str, file_storage, original_filename: str) -> Dict[str, Any]:
-        """Raw uploads are saved on the local disk of the machine that received them.
-        That's fine because file extraction happens in the same request."""
         files_dir = cls._get_project_files_dir(project_id)
         os.makedirs(files_dir, exist_ok=True)
 
@@ -193,7 +190,6 @@ class ProjectManager:
 
     @classmethod
     def save_extracted_text(cls, project_id: str, text: str) -> None:
-        """Extracted text MUST live in Supabase so /build on any machine can read it."""
         supabase_store.save_extracted_text(project_id, text)
 
     @classmethod
