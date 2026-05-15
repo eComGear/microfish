@@ -297,7 +297,7 @@ def get_cached_simulation(project_id: str, input_hash: str):
 
 def upsert_simulation(
     project_id: str,
-    input_hash: str,
+    input_hash: str | None = None,
     *,
     config=None,
     result=None,
@@ -306,6 +306,14 @@ def upsert_simulation(
     simulation_id=None,
     task_id=None,
 ):
+    if not input_hash:
+        input_hash = compute_input_hash({
+            "project_id": project_id,
+            "config": config,
+            "simulation_id": simulation_id,
+            "task_id": task_id,
+        })
+
     row = {
         "project_id": project_id,
         "input_hash": input_hash,
