@@ -1,188 +1,215 @@
-import os
-import uuid
 import logging
+import os
+import tempfile
 import threading
-from flask import Blueprint, request, jsonify
+import uuid
+from typing import Any, Dict, List, Optional
 
+from flask import Blueprint, jsonify, request
+
+from app.services.graph_builder_service import GraphBuilderService
+from app.services.ontology_service import OntologyService
 from app.store import (
-    save_project, get_project,
-    save_task, get_task,
-    save_graph, get_graph,
+    get_graph,
+    get_project,
+    get_task,
+    save_graph,
+    save_project,
+    save_task,
 )
 
-logger = logging.getLogger(__name__)
-graph_bp = Blueprint("graph", __name__)
+log = logging.getLogger(__name__)
 
-UPLOAD_DIR = os.environ.get("UPLOAD_DIR", "/data/uploads")
-os.makedirs(UPLOAD_DIR, exist_ok=True)
+bp = Blueprint("graph", __name__, url_prefix="/api/graph")
 
-ALLOWED_EXT = {".txt", ".md", ".pdf"}
 
-def _read_file(file_storage) -> str:
-    name = (file_storage.filename or "").lower()
-    ext = os.path.splitext(name)[1]
-    if ext not in ALLOWED_EXT:
-        return ""
-    raw = file_storage.read()
-    if ext == ".pdf":
-        try:
-            from pypdf import PdfReader
-            import io
-            reader = PdfReader(io.BytesIO(raw))
-            return "\n".join((p.extract_text() or "") for p in reader.pages)
-        except Exception as e:
-            logger.warning("pdf parse failed for %s: %s", name, e)
-            return ""
-    try:
-        return raw.decode("utf-8", errors="ignore")
-    except Exception:
-        return ""
-
-@graph_bp.get("/health")
+# ---------------------------------------------------------------------------
+# Health
+# ---------------------------------------------------------------------------
+@bp.route("/health", methods=["GET"])
 def health():
-    return jsonify({"success": True, "data": {"status": "ok"}})
+    return jsonify({"ok": True, "service": "graph"})
 
-# ---------- POST /api/graph/ontology/generate (multipart) ----------
-@graph_bp.post("/ontology/generate")
+
+# ---------------------------------------------------------------------------
+# Ontology generation
+# ---------------------------------------------------------------------------
+@bp.route("/ontology/generate", methods=["POST"])
 def ontology_generate():
-    sim_req = (request.form.get("simulation_requirement") or "").strip()
-    project_name = (request.form.get("project_name") or "MiroFish project").strip()
-    extra = (request.form.get("additional_context") or "").strip()
-
-    if not sim_req:
-        return jsonify({"success": False, "error": "simulation_requirement is required"}), 400
-
-    files = request.files.getlist("files") or request.files.getlist("files[]")
-    docs = []
-    file_meta = []
-    for f in files:
-        text = _read_file(f)
-        if text:
-            docs.append(text)
-            file_meta.append({"filename": f.filename, "size": len(text)})
-    if extra:
-        docs.append(extra)
-
     try:
-        from app.services.ontology_generator import OntologyGenerator
-        gen = OntologyGenerator()
-        result = gen.generate(document_texts=docs, simulation_requirement=sim_req)
-        ontology = result.get("ontology") if isinstance(result, dict) else result
-        summary = result.get("analysis_summary", "") if isinstance(result, dict) else ""
-    except Exception as e:
-        logger.exception("ontology generation failed")
-        return jsonify({"success": False, "error": f"ontology generation failed: {e}"}), 500
+        files = request.files.getlist("files") or []
+        simulation_requirement = request.form.get("simulation_requirement", "") or ""
+        project_name = request.form.get("project_name", "MiroFish Project") or "MiroFish Project"
 
-    pid = str(uuid.uuid4())
-    save_project(pid, {
-        "name": project_name,
-        "simulation_requirement": sim_req,
-        "additional_context": extra,
-        "documents": docs,
-        "ontology": ontology,
-        "analysis_summary": summary,
-        "files": file_meta,
-    })
+        if not files:
+            return jsonify({"error": "no files uploaded"}), 400
 
-    return jsonify({"success": True, "data": {
-        "project_id": pid,
-        "project_name": project_name,
-        "ontology": ontology,
-        "analysis_summary": summary,
-        "files": file_meta,
-        "total_text_length": sum(len(d) for d in docs),
-    }})
+        chunks: List[str] = []
+        upload_dir = os.environ.get("UPLOAD_DIR", tempfile.gettempdir())
+        os.makedirs(upload_dir, exist_ok=True)
 
-# ---------- POST /api/graph/build ----------
-def _run_build(task_id: str, project_id: str, graph_name: str):
-    try:
-        save_task(task_id, {"project_id": project_id, "status": "processing", "progress": 5,
-                            "message": "loading project"})
-        proj = get_project(project_id)
-        if not proj:
-            save_task(task_id, {"project_id": project_id, "status": "failed",
-                                "error": "projectNotFound"})
-            return
+        for f in files:
+            dest = os.path.join(upload_dir, f"{uuid.uuid4()}_{f.filename}")
+            f.save(dest)
+            try:
+                with open(dest, "r", encoding="utf-8", errors="ignore") as fh:
+                    text = fh.read().replace("\x00", "")
+            except Exception as e:
+                log.warning("failed to read uploaded file %s: %s", dest, e)
+                text = ""
+            if text.strip():
+                chunks.append(text)
 
-        from app.services.graph_builder_service import GraphBuilderService
-        from app.services.text_processor import TextProcessor
-
-        save_task(task_id, {"project_id": project_id, "status": "processing", "progress": 25,
-                            "message": "splitting text"})
-        chunks = []
-        for d in proj.get("documents") or []:
-            chunks.extend(TextProcessor.split_text(d))
-
-        save_task(task_id, {"project_id": project_id, "status": "processing", "progress": 50,
-                            "message": "building graph"})
-        builder = GraphBuilderService()
-        graph_data = builder.build_from_chunks(
+        ontology_service = OntologyService()
+        ontology = ontology_service.generate_from_chunks(
             chunks=chunks,
-            ontology=proj.get("ontology"),
-            graph_name=graph_name,
+            requirement=simulation_requirement,
         )
 
-        gid = str(uuid.uuid4())
+        project_id = str(uuid.uuid4())
+        save_project(
+            project_id,
+            {
+                "project_id": project_id,
+                "name": project_name,
+                "simulation_requirement": simulation_requirement,
+                "ontology": ontology,
+                "chunks": chunks,
+            },
+        )
+
+        return jsonify(
+            {
+                "project_id": project_id,
+                "ontology": ontology,
+                "chunks_count": len(chunks),
+            }
+        )
+    except Exception as e:
+        log.exception("ontology_generate failed")
+        return jsonify({"error": str(e)}), 500
+
+
+# ---------------------------------------------------------------------------
+# Graph build (async via background thread + task row)
+# ---------------------------------------------------------------------------
+def _run_build(task_id: str, project_id: str, graph_name: str, ontology: Optional[Dict[str, Any]]):
+    try:
+        save_task(task_id, {"task_id": task_id, "status": "running", "project_id": project_id})
+
+        proj = get_project(project_id) or {}
+        chunks: List[str] = proj.get("chunks") or []
+        if not chunks:
+            raise RuntimeError(f"project {project_id} has no chunks; run /api/graph/ontology/generate first")
+
+        builder = GraphBuilderService()
+        graph_data: Dict[str, Any] = builder.build_from_chunks(
+            chunks=chunks,
+            ontology=ontology or proj.get("ontology"),
+            graph_name=graph_name,
+        ) or {}
+
+        # CRITICAL: use the Zep graph_id returned by the builder.
+        # Previously this was overwritten with uuid.uuid4(), which is why
+        # later calls to zep.graph.node.get_by_graph_id() returned 404.
+        gid = graph_data.get("graph_id")
+        if not gid:
+            raise RuntimeError(
+                "graph build completed but GraphBuilderService returned no Zep graph_id"
+            )
+
         nodes = graph_data.get("nodes") or []
         edges = graph_data.get("edges") or []
-        save_graph(gid, {
-            "project_id": project_id,
-            "name": graph_name,
-            "nodes": nodes,
-            "edges": edges,
-        })
-        save_task(task_id, {
-            "project_id": project_id,
-            "status": "completed",
-            "progress": 100,
-            "result": {
+
+        save_graph(
+            gid,
+            {
+                "graph_id": gid,
+                "project_id": project_id,
+                "name": graph_name,
+                "nodes": nodes,
+                "edges": edges,
+            },
+        )
+
+        # Persist the Zep graph_id back onto the project so /api/simulation/* can resolve it.
+        proj["graph_id"] = gid
+        save_project(project_id, proj)
+
+        save_task(
+            task_id,
+            {
+                "task_id": task_id,
+                "status": "succeeded",
                 "project_id": project_id,
                 "graph_id": gid,
-                "node_count": len(nodes),
-                "edge_count": len(edges),
+                "result": {
+                    "graph_id": gid,
+                    "nodes_count": len(nodes),
+                    "edges_count": len(edges),
+                },
             },
-        })
+        )
     except Exception as e:
-        logger.exception("graph build failed")
-        save_task(task_id, {"project_id": project_id, "status": "failed", "error": str(e)})
+        log.exception("graph build failed for task %s", task_id)
+        save_task(
+            task_id,
+            {
+                "task_id": task_id,
+                "status": "failed",
+                "project_id": project_id,
+                "error": str(e),
+            },
+        )
 
-@graph_bp.post("/build")
-def build():
-    body = request.get_json(silent=True) or {}
-    project_id = body.get("project_id")
-    graph_name = body.get("graph_name") or "graph"
-    if not project_id:
-        return jsonify({"success": False, "error": "project_id is required"}), 400
-    if not get_project(project_id):
-        return jsonify({"success": False, "error": "projectNotFound"}), 404
 
-    task_id = str(uuid.uuid4())
-    save_task(task_id, {"project_id": project_id, "status": "pending", "progress": 0})
-    threading.Thread(target=_run_build, args=(task_id, project_id, graph_name), daemon=True).start()
-    return jsonify({"success": True, "data": {
-        "project_id": project_id,
-        "task_id": task_id,
-        "message": "graph build started",
-    }})
+@bp.route("/build", methods=["POST"])
+def graph_build():
+    try:
+        data = request.get_json(silent=True) or {}
+        project_id = data.get("project_id")
+        graph_name = data.get("graph_name") or "MiroFish Graph"
+        ontology = data.get("ontology")
 
-# ---------- GET /api/graph/task/<task_id> ----------
-@graph_bp.get("/task/<task_id>")
-def task_status(task_id: str):
-    t = get_task(task_id)
-    if not t:
-        return jsonify({"success": False, "error": "taskNotFound"}), 404
-    return jsonify({"success": True, "data": {"task_id": task_id, **t}})
+        if not project_id:
+            return jsonify({"error": "project_id required"}), 400
+        if not get_project(project_id):
+            return jsonify({"error": f"project {project_id} not found"}), 404
 
-# ---------- GET /api/graph/data/<graph_id> ----------
-@graph_bp.get("/data/<graph_id>")
-def graph_data(graph_id: str):
+        task_id = str(uuid.uuid4())
+        save_task(task_id, {"task_id": task_id, "status": "queued", "project_id": project_id})
+
+        t = threading.Thread(
+            target=_run_build,
+            args=(task_id, project_id, graph_name, ontology),
+            daemon=True,
+        )
+        t.start()
+
+        return jsonify({"task_id": task_id, "status": "queued"})
+    except Exception as e:
+        log.exception("graph_build failed")
+        return jsonify({"error": str(e)}), 500
+
+
+@bp.route("/build/status", methods=["GET"])
+def graph_build_status():
+    task_id = request.args.get("task_id")
+    if not task_id:
+        return jsonify({"error": "task_id required"}), 400
+    task = get_task(task_id)
+    if not task:
+        return jsonify({"error": "task not found"}), 404
+    return jsonify(task)
+
+
+# ---------------------------------------------------------------------------
+# Graph read
+# ---------------------------------------------------------------------------
+@bp.route("/<graph_id>", methods=["GET"])
+def graph_get(graph_id: str):
     g = get_graph(graph_id)
     if not g:
-        return jsonify({"success": False, "error": "graphNotFound"}), 404
-    return jsonify({"success": True, "data": {
-        "graph_id": graph_id,
-        "nodes": g.get("nodes") or [],
-        "edges": g.get("edges") or [],
-    }})
-
+        return jsonify({"error": "graph not found"}), 404
+    return jsonify(g)
 
